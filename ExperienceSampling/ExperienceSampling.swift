@@ -156,6 +156,7 @@ final class WakeDetector {
 
 struct LikertScale: View {
     @Binding var selectedValue: Int?
+    var isFocused: Bool = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -170,48 +171,81 @@ struct LikertScale: View {
                             .cornerRadius(6)
                     }
                     .buttonStyle(.plain)
+                    .keyboardShortcut(KeyEquivalent(Character("\(value)")), modifiers: [])
                 }
             }
+            .padding(4)
+            .background(isFocused ? Color.accentColor.opacity(0.1) : Color.clear)
+            .cornerRadius(8)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isFocused ? Color.accentColor : Color.clear, lineWidth: 2)
+            )
             HStack {
                 Text("Not at all").font(.caption).foregroundColor(.secondary)
                 Spacer()
                 Text("Very excited").font(.caption).foregroundColor(.secondary)
             }
+            if isFocused {
+                Text("Press 1-7 to select").font(.caption2).foregroundColor(.secondary)
+            }
         }
     }
+}
+
+enum StartOfDayFocus: Hashable {
+    case scale
+    case dismiss
+    case submit
 }
 
 struct StartOfDayView: View {
     @Binding var isPresented: Bool
     @State private var excitement: Int? = nil
+    @FocusState private var focus: StartOfDayFocus?
     var onSubmit: (Int) -> Void
 
     var body: some View {
         VStack(spacing: 20) {
             Text("Good morning!").font(.title2).fontWeight(.semibold)
             Text("How excited are you to start working today?")
-            LikertScale(selectedValue: $excitement)
+            LikertScale(selectedValue: $excitement, isFocused: focus == .scale)
+                .focusable()
+                .focused($focus, equals: .scale)
             HStack(spacing: 12) {
                 Button("Dismiss") { isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
+                    .focused($focus, equals: .dismiss)
                 Button("Submit") {
                     if let v = excitement { onSubmit(v); isPresented = false }
                 }
                 .keyboardShortcut(.return, modifiers: [])
                 .disabled(excitement == nil)
                 .buttonStyle(.borderedProminent)
+                .focused($focus, equals: .submit)
             }
         }
         .padding(24)
         .frame(width: 320)
-        .onAppear { NSApp.activate(ignoringOtherApps: true) }
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            focus = .scale
+        }
     }
+}
+
+enum IntradayFocus: Hashable {
+    case activity
+    case scale
+    case dismiss
+    case submit
 }
 
 struct IntradayView: View {
     @Binding var isPresented: Bool
     @State private var activity: String = ""
     @State private var excitement: Int? = nil
+    @FocusState private var focus: IntradayFocus?
     var onSubmit: (String, Int) -> Void
 
     private var isValid: Bool { !activity.trimmingCharacters(in: .whitespaces).isEmpty && excitement != nil }
@@ -224,29 +258,38 @@ struct IntradayView: View {
                 Text("What are you doing?")
                 TextField("Brief description (5 words max)", text: $activity)
                     .textFieldStyle(.roundedBorder)
+                    .focused($focus, equals: .activity)
                     .onChange(of: activity) { _, new in if new.count > 30 { activity = String(new.prefix(30)) } }
+                    .onSubmit { focus = .scale }
                 Text("\(activity.count)/30 characters").font(.caption).foregroundColor(.secondary)
             }
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("How excited are you about this?")
-                LikertScale(selectedValue: $excitement)
+                LikertScale(selectedValue: $excitement, isFocused: focus == .scale)
+                    .focusable()
+                    .focused($focus, equals: .scale)
             }
 
             HStack(spacing: 12) {
                 Button("Dismiss") { isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
+                    .focused($focus, equals: .dismiss)
                 Button("Submit") {
                     if isValid, let e = excitement { onSubmit(activity.trimmingCharacters(in: .whitespaces), e); isPresented = false }
                 }
                 .keyboardShortcut(.return, modifiers: [])
                 .disabled(!isValid)
                 .buttonStyle(.borderedProminent)
+                .focused($focus, equals: .submit)
             }
         }
         .padding(24)
         .frame(width: 340)
-        .onAppear { NSApp.activate(ignoringOtherApps: true) }
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            focus = .activity
+        }
     }
 }
 
