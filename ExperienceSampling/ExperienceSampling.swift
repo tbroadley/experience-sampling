@@ -16,6 +16,24 @@ struct Response: Codable, Identifiable {
     var activity: String?
 }
 
+// MARK: - Pomodoro Data Model
+
+enum PomodoroPhase: String, Codable {
+    case idle
+    case work
+    case shortBreak
+    case longBreak
+}
+
+struct PomodoroSession: Codable, Identifiable {
+    var id: UUID = UUID()
+    var startTime: Date
+    var endTime: Date?
+    var taskDescription: String
+    var completed: Bool
+    var pomodoroNumber: Int  // 1-4, for tracking long break cycle
+}
+
 // MARK: - Simple JSON Storage
 
 final class DataStore {
@@ -71,6 +89,75 @@ final class DataStore {
     }
 }
 
+// MARK: - Pomodoro Data Store
+
+final class PomodoroDataStore {
+    static let shared = PomodoroDataStore()
+
+    private let fileURL: URL
+    private var sessions: [PomodoroSession] = []
+
+    private init() {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let appDir = appSupport.appendingPathComponent("ExperienceSampling", isDirectory: true)
+        try? FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
+        fileURL = appDir.appendingPathComponent("pomodoro-sessions.json")
+        load()
+    }
+
+    private func load() {
+        guard let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([PomodoroSession].self, from: data) else {
+            sessions = []
+            return
+        }
+        sessions = decoded
+    }
+
+    private func save() {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .prettyPrinted
+        guard let data = try? encoder.encode(sessions) else { return }
+        try? data.write(to: fileURL)
+    }
+
+    func add(_ session: PomodoroSession) {
+        sessions.append(session)
+        save()
+    }
+
+    func updateLast(endTime: Date, completed: Bool) {
+        guard !sessions.isEmpty else { return }
+        sessions[sessions.count - 1].endTime = endTime
+        sessions[sessions.count - 1].completed = completed
+        save()
+    }
+
+    func fetchRecent(limit: Int = 50) -> [PomodoroSession] {
+        Array(sessions.sorted { $0.startTime > $1.startTime }.prefix(limit))
+    }
+
+    func completedTodayCount() -> Int {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        return sessions.filter { $0.completed && calendar.startOfDay(for: $0.startTime) == today }.count
+    }
+
+    func exportCSV() -> URL {
+        let formatter = ISO8601DateFormatter()
+        var csv = "id,start_time,end_time,task,completed,pomodoro_number\n"
+        for s in sessions.sorted(by: { $0.startTime < $1.startTime }) {
+            let task = s.taskDescription.replacingOccurrences(of: "\"", with: "\"\"")
+            let endTime = s.endTime.map { formatter.string(from: $0) } ?? ""
+            csv += "\(s.id),\(formatter.string(from: s.startTime)),\(endTime),\"\(task)\",\(s.completed),\(s.pomodoroNumber)\n"
+        }
+        let exportURL = FileManager.default.temporaryDirectory.appendingPathComponent("pomodoro-export.csv")
+        try? csv.write(to: exportURL, atomically: true, encoding: .utf8)
+        return exportURL
+    }
+}
+
 // MARK: - Prompt Scheduler
 
 final class PromptScheduler: ObservableObject {
@@ -118,11 +205,121 @@ final class PromptScheduler: ObservableObject {
     }
 }
 
+// MARK: - Pomodoro Scheduler
+
+final class PomodoroScheduler: ObservableObject {
+    @Published var phase: PomodoroPhase = .idle
+    @Published var timeRemaining: Int = 0
+    @Published var currentTask: String = ""
+    @Published var pomodoroCount: Int = 0  // cycles 1-4
+
+    var workDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroWorkDuration").nonZeroOr(25) }
+    var shortBreakDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroShortBreak").nonZeroOr(5) }
+    var longBreakDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroLongBreak").nonZeroOr(15) }
+    var snoozeDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroSnooze").nonZeroOr(30) }
+
+    private var displayTimer: Timer?
+    private var snoozeTimer: Timer?
+
+    var onTimerTick: ((Int, PomodoroPhase) -> Void)?
+    var onWorkSessionEnd: (() -> Void)?
+    var onBreakEnd: (() -> Void)?
+    var onSnoozeEnd: (() -> Void)?
+
+    func startWork(task: String) {
+        currentTask = task
+        pomodoroCount = (pomodoroCount % 4) + 1
+        phase = .work
+        timeRemaining = workDuration * 60
+
+        PomodoroDataStore.shared.add(PomodoroSession(
+            startTime: Date(),
+            taskDescription: task,
+            completed: false,
+            pomodoroNumber: pomodoroCount
+        ))
+
+        startDisplayTimer()
+    }
+
+    func startBreak(isLong: Bool) {
+        phase = isLong ? .longBreak : .shortBreak
+        timeRemaining = (isLong ? longBreakDuration : shortBreakDuration) * 60
+        startDisplayTimer()
+    }
+
+    func skipBreak() {
+        phase = .idle
+        stopDisplayTimer()
+        onTimerTick?(0, .idle)
+    }
+
+    func abandon() {
+        phase = .idle
+        stopDisplayTimer()
+        snoozeTimer?.invalidate()
+        snoozeTimer = nil
+        PomodoroDataStore.shared.updateLast(endTime: Date(), completed: false)
+        onTimerTick?(0, .idle)
+    }
+
+    func endForNow() {
+        phase = .idle
+        stopDisplayTimer()
+        onTimerTick?(0, .idle)
+    }
+
+    func scheduleSnooze() {
+        snoozeTimer?.invalidate()
+        snoozeTimer = Timer.scheduledTimer(withTimeInterval: Double(snoozeDuration * 60), repeats: false) { [weak self] _ in
+            self?.onSnoozeEnd?()
+        }
+    }
+
+    private func startDisplayTimer() {
+        stopDisplayTimer()
+        onTimerTick?(timeRemaining, phase)
+        displayTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.timeRemaining -= 1
+            self.onTimerTick?(self.timeRemaining, self.phase)
+
+            if self.timeRemaining <= 0 {
+                self.stopDisplayTimer()
+                if self.phase == .work {
+                    PomodoroDataStore.shared.updateLast(endTime: Date(), completed: true)
+                    self.onWorkSessionEnd?()
+                } else {
+                    self.phase = .idle
+                    self.onBreakEnd?()
+                }
+            }
+        }
+    }
+
+    private func stopDisplayTimer() {
+        displayTimer?.invalidate()
+        displayTimer = nil
+    }
+
+    func isLongBreakDue() -> Bool {
+        pomodoroCount == 4
+    }
+
+    func formattedTime() -> String {
+        let mins = timeRemaining / 60
+        let secs = timeRemaining % 60
+        return String(format: "%02d:%02d", mins, secs)
+    }
+}
+
 // MARK: - Wake Detector
 
 final class WakeDetector {
     private let lastPromptDateKey = "lastStartOfDayPromptDate"
+    private let lastPomodoroPromptDateKey = "lastPomodoroStartOfDayPromptDate"
     var onNewDayDetected: (() -> Void)?
+    var onNewPomodoroDay: (() -> Void)?
 
     init() {
         let nc = NSWorkspace.shared.notificationCenter
@@ -138,17 +335,30 @@ final class WakeDetector {
     private func checkForNewDay() {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
+
         let lastDate = UserDefaults.standard.object(forKey: lastPromptDateKey) as? Date
         let lastDay = lastDate.map { calendar.startOfDay(for: $0) }
         if lastDay != today { onNewDayDetected?() }
+
+        let lastPomodoroDate = UserDefaults.standard.object(forKey: lastPomodoroPromptDateKey) as? Date
+        let lastPomodoroDay = lastPomodoroDate.map { calendar.startOfDay(for: $0) }
+        if lastPomodoroDay != today { onNewPomodoroDay?() }
     }
 
     func markTodayAsPrompted() {
         UserDefaults.standard.set(Date(), forKey: lastPromptDateKey)
     }
 
+    func markPomodoroPrompted() {
+        UserDefaults.standard.set(Date(), forKey: lastPomodoroPromptDateKey)
+    }
+
     func reset() {
         UserDefaults.standard.removeObject(forKey: lastPromptDateKey)
+    }
+
+    func resetPomodoro() {
+        UserDefaults.standard.removeObject(forKey: lastPomodoroPromptDateKey)
     }
 }
 
@@ -330,19 +540,249 @@ struct SettingsView: View {
     @AppStorage("workingHoursStart") private var workStart = 9
     @AppStorage("workingHoursEnd") private var workEnd = 17
     @AppStorage("averagePromptsPerDay") private var prompts = 3.0
+    @AppStorage("pomodoroWorkDuration") private var workDuration = 25
+    @AppStorage("pomodoroShortBreak") private var shortBreak = 5
+    @AppStorage("pomodoroLongBreak") private var longBreak = 15
+    @AppStorage("pomodoroSnooze") private var snooze = 30
+
+    @State private var selectedTab = 0
 
     var body: some View {
-        Form {
-            Picker("Work Start", selection: $workStart) {
-                ForEach(5..<13, id: \.self) { Text("\($0):00").tag($0) }
+        TabView(selection: $selectedTab) {
+            Form {
+                Picker("Work Start", selection: $workStart) {
+                    ForEach(5..<13, id: \.self) { Text("\($0):00").tag($0) }
+                }
+                Picker("Work End", selection: $workEnd) {
+                    ForEach(14..<22, id: \.self) { Text("\($0):00").tag($0) }
+                }
+                Stepper("Prompts per day: \(Int(prompts))", value: $prompts, in: 1...10)
             }
-            Picker("Work End", selection: $workEnd) {
-                ForEach(14..<22, id: \.self) { Text("\($0):00").tag($0) }
+            .tabItem { Label("Sampling", systemImage: "chart.bar.doc.horizontal") }
+            .tag(0)
+
+            Form {
+                Stepper("Work session: \(workDuration) min", value: $workDuration, in: 1...60)
+                Stepper("Short break: \(shortBreak) min", value: $shortBreak, in: 1...30)
+                Stepper("Long break: \(longBreak) min", value: $longBreak, in: 5...60)
+                Stepper("Snooze: \(snooze) min", value: $snooze, in: 5...120)
             }
-            Stepper("Prompts per day: \(Int(prompts))", value: $prompts, in: 1...10)
+            .tabItem { Label("Pomodoro", systemImage: "timer") }
+            .tag(1)
         }
         .padding()
+        .frame(width: 320, height: 180)
+    }
+}
+
+// MARK: - Pomodoro Views
+
+enum CombinedStartFocus: Hashable {
+    case scale
+    case startPomodoro
+    case snooze
+}
+
+struct CombinedStartOfDayView: View {
+    @State private var excitement: Int? = nil
+    @FocusState private var focus: CombinedStartFocus?
+    var onStartPomodoro: (Int) -> Void
+    var onSnooze: (Int) -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Good morning!").font(.title2).fontWeight(.semibold)
+            Text("How excited are you to work today?")
+            LikertScale(selectedValue: $excitement, isFocused: focus == .scale)
+                .focusable()
+                .focused($focus, equals: .scale)
+            HStack(spacing: 12) {
+                Button("Snooze 30 min") {
+                    if let v = excitement { onSnooze(v) }
+                }
+                .disabled(excitement == nil)
+                .focused($focus, equals: .snooze)
+                Button("Start Pomodoro") {
+                    if let v = excitement { onStartPomodoro(v) }
+                }
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(excitement == nil)
+                .buttonStyle(.borderedProminent)
+                .focused($focus, equals: .startPomodoro)
+            }
+        }
+        .padding(24)
+        .frame(width: 340)
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            focus = .scale
+        }
+    }
+}
+
+enum TaskInputFocus: Hashable {
+    case textField
+    case cancel
+    case start
+}
+
+struct PomodoroTaskInputView: View {
+    @Binding var isPresented: Bool
+    @State private var task: String = ""
+    @FocusState private var focus: TaskInputFocus?
+    var onStart: (String) -> Void
+
+    private var isValid: Bool { !task.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Start Pomodoro").font(.title2).fontWeight(.semibold)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("What will you work on?")
+                TextField("Task description", text: $task)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focus, equals: .textField)
+                    .onSubmit { if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
+            }
+            HStack(spacing: 12) {
+                Button("Cancel") { isPresented = false }
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .focused($focus, equals: .cancel)
+                Button("Start") {
+                    if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false }
+                }
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(!isValid)
+                .buttonStyle(.borderedProminent)
+                .focused($focus, equals: .start)
+            }
+        }
+        .padding(24)
+        .frame(width: 320)
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            focus = .textField
+        }
+    }
+}
+
+enum BreakFocus: Hashable {
+    case skip
+    case start
+}
+
+struct PomodoroBreakView: View {
+    @Binding var isPresented: Bool
+    let isLongBreak: Bool
+    let breakDuration: Int
+    @FocusState private var focus: BreakFocus?
+    var onStartBreak: () -> Void
+    var onSkipBreak: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Pomodoro Complete!").font(.title2).fontWeight(.semibold)
+            Text("Great work! Time for a \(isLongBreak ? "long" : "short") break.")
+            Text("\(breakDuration) minutes").font(.title).fontWeight(.medium)
+            HStack(spacing: 12) {
+                Button("Skip break") { onSkipBreak(); isPresented = false }
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .focused($focus, equals: .skip)
+                Button("Start break") { onStartBreak(); isPresented = false }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .buttonStyle(.borderedProminent)
+                    .focused($focus, equals: .start)
+            }
+        }
+        .padding(24)
         .frame(width: 300)
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            focus = .start
+        }
+    }
+}
+
+enum NextFocus: Hashable {
+    case task
+    case endForNow
+    case startNext
+}
+
+struct PomodoroNextView: View {
+    @Binding var isPresented: Bool
+    @State private var task: String = ""
+    @FocusState private var focus: NextFocus?
+    var onStartNext: (String) -> Void
+    var onEndForNow: () -> Void
+
+    private var isValid: Bool { !task.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Break's Over!").font(.title2).fontWeight(.semibold)
+            Text("Ready for another Pomodoro?")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("What will you work on?")
+                TextField("Task description", text: $task)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focus, equals: .task)
+                    .onSubmit { if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
+            }
+            HStack(spacing: 12) {
+                Button("End for now") { onEndForNow(); isPresented = false }
+                    .keyboardShortcut(.escape, modifiers: [])
+                    .focused($focus, equals: .endForNow)
+                Button("Start Pomodoro") {
+                    if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false }
+                }
+                .keyboardShortcut(.return, modifiers: [])
+                .disabled(!isValid)
+                .buttonStyle(.borderedProminent)
+                .focused($focus, equals: .startNext)
+            }
+        }
+        .padding(24)
+        .frame(width: 320)
+        .onAppear {
+            NSApp.activate(ignoringOtherApps: true)
+            focus = .task
+        }
+    }
+}
+
+struct PomodoroHistoryView: View {
+    @State private var sessions: [PomodoroSession] = []
+    private let formatter: DateFormatter = {
+        let f = DateFormatter(); f.dateStyle = .medium; f.timeStyle = .short; return f
+    }()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Pomodoro History").font(.headline).padding()
+            if sessions.isEmpty {
+                Text("No Pomodoros yet").foregroundColor(.secondary).padding()
+            } else {
+                List(sessions) { s in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(s.completed ? "Completed" : "Abandoned")
+                                .font(.caption)
+                                .foregroundColor(s.completed ? .green : .secondary)
+                            Spacer()
+                            Text(formatter.string(from: s.startTime)).font(.caption).foregroundColor(.secondary)
+                        }
+                        Text(s.taskDescription).lineLimit(1)
+                        if let end = s.endTime {
+                            let duration = Int(end.timeIntervalSince(s.startTime) / 60)
+                            Text("\(duration) min").font(.caption).foregroundColor(.secondary)
+                        }
+                    }.padding(.vertical, 4)
+                }
+            }
+        }
+        .frame(width: 400, height: 300)
+        .onAppear { sessions = PomodoroDataStore.shared.fetchRecent() }
     }
 }
 
@@ -353,6 +793,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var promptWindow: NSWindow?
     private let scheduler = PromptScheduler()
     private let wakeDetector = WakeDetector()
+    private let pomodoroScheduler = PomodoroScheduler()
+    private var abandonMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -361,6 +803,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduler.start()
 
         wakeDetector.onNewDayDetected = { [weak self] in self?.showStartOfDayPrompt() }
+        wakeDetector.onNewPomodoroDay = { [weak self] in self?.showPomodoroStartOfDay() }
+
+        pomodoroScheduler.onTimerTick = { [weak self] seconds, phase in
+            self?.updateMenuBarForPomodoro(seconds: seconds, phase: phase)
+        }
+        pomodoroScheduler.onWorkSessionEnd = { [weak self] in self?.showPomodoroBreak() }
+        pomodoroScheduler.onBreakEnd = { [weak self] in self?.showPomodoroNext() }
+        pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInput() }
     }
 
     private func setupStatusItem() {
@@ -370,14 +820,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Check in now", action: #selector(showIntradayPrompt), keyEquivalent: "c"))
         menu.addItem(.separator())
+
+        menu.addItem(NSMenuItem(title: "Start Pomodoro", action: #selector(showPomodoroTaskInput), keyEquivalent: "p"))
+        let abandon = NSMenuItem(title: "Abandon Pomodoro", action: #selector(abandonPomodoro), keyEquivalent: "")
+        abandon.isEnabled = false
+        abandonMenuItem = abandon
+        menu.addItem(abandon)
+        menu.addItem(.separator())
+
         menu.addItem(NSMenuItem(title: "View History", action: #selector(showHistory), keyEquivalent: "h"))
+        menu.addItem(NSMenuItem(title: "Pomodoro History", action: #selector(showPomodoroHistory), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Export Data...", action: #selector(exportData), keyEquivalent: "e"))
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(.separator())
 
         let debug = NSMenu()
         debug.addItem(NSMenuItem(title: "Show Start of Day", action: #selector(showStartOfDayPrompt), keyEquivalent: ""))
+        debug.addItem(NSMenuItem(title: "Show Pomodoro Start", action: #selector(showPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Reset Start of Day", action: #selector(resetStartOfDay), keyEquivalent: ""))
+        debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         let debugItem = NSMenuItem(title: "Debug", action: nil, keyEquivalent: "")
         debugItem.submenu = debug
         menu.addItem(debugItem)
@@ -387,12 +848,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    private func showWindow<V: View>(_ view: V) {
+    private func updateMenuBarForPomodoro(seconds: Int, phase: PomodoroPhase) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            switch phase {
+            case .idle:
+                self.statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: "Experience Sampling")
+                self.statusItem.button?.title = ""
+                self.abandonMenuItem?.isEnabled = false
+            case .work:
+                self.statusItem.button?.image = nil
+                let mins = seconds / 60
+                let secs = seconds % 60
+                self.statusItem.button?.title = String(format: "🍅 %02d:%02d", mins, secs)
+                self.abandonMenuItem?.isEnabled = true
+            case .shortBreak, .longBreak:
+                self.statusItem.button?.image = nil
+                let mins = seconds / 60
+                let secs = seconds % 60
+                self.statusItem.button?.title = String(format: "☕️ %02d:%02d", mins, secs)
+                self.abandonMenuItem?.isEnabled = false
+            }
+        }
+    }
+
+    private func showWindow<V: View>(_ view: V, allowClose: Bool = true) {
         promptWindow?.close()
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
+        var styleMask: NSWindow.StyleMask = [.titled]
+        if allowClose { styleMask.insert(.closable) }
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: hosting.fittingSize),
-                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                              styleMask: styleMask, backing: .buffered, defer: false)
         window.contentView = hosting
         window.center()
         window.level = .floating
@@ -413,6 +900,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showWindow(view)
     }
 
+    @objc private func showPomodoroStartOfDay() {
+        let view = CombinedStartOfDayView(
+            onStartPomodoro: { [weak self] excitement in
+                DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
+                self?.wakeDetector.markPomodoroPrompted()
+                self?.promptWindow?.close()
+                self?.showPomodoroTaskInput()
+            },
+            onSnooze: { [weak self] excitement in
+                DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
+                self?.wakeDetector.markPomodoroPrompted()
+                self?.pomodoroScheduler.scheduleSnooze()
+                self?.promptWindow?.close()
+            }
+        )
+        showWindow(view, allowClose: false)
+    }
+
+    @objc private func showPomodoroTaskInput() {
+        var presented = true
+        let view = PomodoroTaskInputView(isPresented: Binding(get: { presented }, set: { [weak self] v in
+            presented = v; if !v { self?.promptWindow?.close() }
+        })) { [weak self] task in
+            self?.pomodoroScheduler.startWork(task: task)
+        }
+        showWindow(view)
+    }
+
+    private func showPomodoroBreak() {
+        let isLong = pomodoroScheduler.isLongBreakDue()
+        let duration = isLong ? pomodoroScheduler.longBreakDuration : pomodoroScheduler.shortBreakDuration
+        var presented = true
+        let view = PomodoroBreakView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.promptWindow?.close() }
+            }),
+            isLongBreak: isLong,
+            breakDuration: duration,
+            onStartBreak: { [weak self] in self?.pomodoroScheduler.startBreak(isLong: isLong) },
+            onSkipBreak: { [weak self] in self?.pomodoroScheduler.skipBreak() }
+        )
+        showWindow(view)
+    }
+
+    private func showPomodoroNext() {
+        var presented = true
+        let view = PomodoroNextView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.promptWindow?.close() }
+            }),
+            onStartNext: { [weak self] task in self?.pomodoroScheduler.startWork(task: task) },
+            onEndForNow: { [weak self] in self?.pomodoroScheduler.endForNow() }
+        )
+        showWindow(view)
+    }
+
+    @objc private func abandonPomodoro() {
+        pomodoroScheduler.abandon()
+    }
+
     @objc private func showIntradayPrompt() {
         let hour = Calendar.current.component(.hour, from: Date())
         guard hour >= scheduler.workingHoursStart && hour < scheduler.workingHoursEnd else { return }
@@ -427,8 +974,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showHistory() { showWindow(HistoryView()) }
+    @objc private func showPomodoroHistory() { showWindow(PomodoroHistoryView()) }
     @objc private func showSettings() { showWindow(SettingsView()) }
     @objc private func resetStartOfDay() { wakeDetector.reset() }
+    @objc private func resetPomodoroStartOfDay() { wakeDetector.resetPomodoro() }
 
     @objc private func exportData() {
         let url = DataStore.shared.exportCSV()

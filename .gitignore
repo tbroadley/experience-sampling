@@ -13,3 +13,6 @@ DerivedData/
 # Build artifacts
 *.o
 *.app
+
+# Local config
+.env
