@@ -221,10 +221,63 @@ final class PomodoroScheduler: ObservableObject {
     private var displayTimer: Timer?
     private var snoozeTimer: Timer?
 
+    private let phaseKey = "pomodoroPhase"
+    private let phaseStartKey = "pomodoroPhaseStart"
+    private let phaseDurationKey = "pommadoroPhaseDuration"
+    private let taskKey = "pomodoroTask"
+    private let countKey = "pomodoroCount"
+
     var onTimerTick: ((Int, PomodoroPhase) -> Void)?
     var onWorkSessionEnd: (() -> Void)?
     var onBreakEnd: (() -> Void)?
     var onSnoozeEnd: (() -> Void)?
+
+    init() {
+        pomodoroCount = UserDefaults.standard.integer(forKey: countKey)
+    }
+
+    func restoreState() {
+        guard let phaseRaw = UserDefaults.standard.string(forKey: phaseKey),
+              let savedPhase = PomodoroPhase(rawValue: phaseRaw),
+              savedPhase != .idle,
+              let phaseStart = UserDefaults.standard.object(forKey: phaseStartKey) as? Date else {
+            return
+        }
+
+        let duration = UserDefaults.standard.integer(forKey: phaseDurationKey)
+        let elapsed = Int(Date().timeIntervalSince(phaseStart))
+        let remaining = duration - elapsed
+
+        if remaining > 0 {
+            phase = savedPhase
+            currentTask = UserDefaults.standard.string(forKey: taskKey) ?? ""
+            timeRemaining = remaining
+            startDisplayTimer()
+        } else {
+            clearSavedState()
+            if savedPhase == .work {
+                PomodoroDataStore.shared.updateLast(endTime: phaseStart.addingTimeInterval(Double(duration)), completed: true)
+                onWorkSessionEnd?()
+            } else {
+                onBreakEnd?()
+            }
+        }
+    }
+
+    private func saveState() {
+        UserDefaults.standard.set(phase.rawValue, forKey: phaseKey)
+        UserDefaults.standard.set(Date(), forKey: phaseStartKey)
+        UserDefaults.standard.set(timeRemaining, forKey: phaseDurationKey)
+        UserDefaults.standard.set(currentTask, forKey: taskKey)
+        UserDefaults.standard.set(pomodoroCount, forKey: countKey)
+    }
+
+    private func clearSavedState() {
+        UserDefaults.standard.removeObject(forKey: phaseKey)
+        UserDefaults.standard.removeObject(forKey: phaseStartKey)
+        UserDefaults.standard.removeObject(forKey: phaseDurationKey)
+        UserDefaults.standard.removeObject(forKey: taskKey)
+    }
 
     func startWork(task: String) {
         currentTask = task
@@ -239,18 +292,21 @@ final class PomodoroScheduler: ObservableObject {
             pomodoroNumber: pomodoroCount
         ))
 
+        saveState()
         startDisplayTimer()
     }
 
     func startBreak(isLong: Bool) {
         phase = isLong ? .longBreak : .shortBreak
         timeRemaining = (isLong ? longBreakDuration : shortBreakDuration) * 60
+        saveState()
         startDisplayTimer()
     }
 
     func skipBreak() {
         phase = .idle
         stopDisplayTimer()
+        clearSavedState()
         onTimerTick?(0, .idle)
     }
 
@@ -259,6 +315,7 @@ final class PomodoroScheduler: ObservableObject {
         stopDisplayTimer()
         snoozeTimer?.invalidate()
         snoozeTimer = nil
+        clearSavedState()
         PomodoroDataStore.shared.updateLast(endTime: Date(), completed: false)
         onTimerTick?(0, .idle)
     }
@@ -266,6 +323,7 @@ final class PomodoroScheduler: ObservableObject {
     func endForNow() {
         phase = .idle
         stopDisplayTimer()
+        clearSavedState()
         onTimerTick?(0, .idle)
     }
 
@@ -286,6 +344,7 @@ final class PomodoroScheduler: ObservableObject {
 
             if self.timeRemaining <= 0 {
                 self.stopDisplayTimer()
+                self.clearSavedState()
                 if self.phase == .work {
                     PomodoroDataStore.shared.updateLast(endTime: Date(), completed: true)
                     self.onWorkSessionEnd?()
@@ -320,6 +379,7 @@ final class WakeDetector {
     private let lastPomodoroPromptDateKey = "lastPomodoroStartOfDayPromptDate"
     var onNewDayDetected: (() -> Void)?
     var onNewPomodoroDay: (() -> Void)?
+    var shouldSuppressPomodoroPrompt: (() -> Bool)?
 
     init() {
         let nc = NSWorkspace.shared.notificationCenter
@@ -329,10 +389,10 @@ final class WakeDetector {
         nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.checkForNewDay()
         }
-        checkForNewDay()
     }
 
-    private func checkForNewDay() {
+    func checkForNewDay() {
+        UserDefaults.standard.synchronize()
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
 
@@ -342,7 +402,9 @@ final class WakeDetector {
 
         let lastPomodoroDate = UserDefaults.standard.object(forKey: lastPomodoroPromptDateKey) as? Date
         let lastPomodoroDay = lastPomodoroDate.map { calendar.startOfDay(for: $0) }
-        if lastPomodoroDay != today { onNewPomodoroDay?() }
+        if lastPomodoroDay != today && shouldSuppressPomodoroPrompt?() != true {
+            onNewPomodoroDay?()
+        }
     }
 
     func markTodayAsPrompted() {
@@ -804,6 +866,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         wakeDetector.onNewDayDetected = { [weak self] in self?.showStartOfDayPrompt() }
         wakeDetector.onNewPomodoroDay = { [weak self] in self?.showPomodoroStartOfDay() }
+        wakeDetector.shouldSuppressPomodoroPrompt = { [weak self] in
+            self?.pomodoroScheduler.phase != .idle
+        }
 
         pomodoroScheduler.onTimerTick = { [weak self] seconds, phase in
             self?.updateMenuBarForPomodoro(seconds: seconds, phase: phase)
@@ -811,6 +876,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pomodoroScheduler.onWorkSessionEnd = { [weak self] in self?.showPomodoroBreak() }
         pomodoroScheduler.onBreakEnd = { [weak self] in self?.showPomodoroNext() }
         pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInput() }
+
+        pomodoroScheduler.restoreState()
+        wakeDetector.checkForNewDay()
     }
 
     private func setupStatusItem() {
