@@ -18,5 +18,16 @@
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>org.metr.ExperienceSampling</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>experiencesampling</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

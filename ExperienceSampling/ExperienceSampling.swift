@@ -395,6 +395,10 @@ final class WakeDetector {
         UserDefaults.standard.synchronize()
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
+        let hour = calendar.component(.hour, from: Date())
+
+        // Only show "Good morning" prompts before noon
+        guard hour < 12 else { return }
 
         let lastDate = UserDefaults.standard.object(forKey: lastPromptDateKey) as? Date
         let lastDay = lastDate.map { calendar.startOfDay(for: $0) }
@@ -684,7 +688,7 @@ struct CombinedStartOfDayView: View {
 
 enum TaskInputFocus: Hashable {
     case textField
-    case cancel
+    case snooze
     case start
 }
 
@@ -693,6 +697,7 @@ struct PomodoroTaskInputView: View {
     @State private var task: String = ""
     @FocusState private var focus: TaskInputFocus?
     var onStart: (String) -> Void
+    var onSnooze: () -> Void
 
     private var isValid: Bool { !task.trimmingCharacters(in: .whitespaces).isEmpty }
 
@@ -707,9 +712,9 @@ struct PomodoroTaskInputView: View {
                     .onSubmit { if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
             }
             HStack(spacing: 12) {
-                Button("Cancel") { isPresented = false }
+                Button("Snooze 30 min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .cancel)
+                    .focused($focus, equals: .snooze)
                 Button("Start") {
                     if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false }
                 }
@@ -879,6 +884,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         pomodoroScheduler.restoreState()
         wakeDetector.checkForNewDay()
+
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleURLEvent(_:withReply:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
+
+    @objc private func handleURLEvent(_ event: NSAppleEventDescriptor, withReply reply: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: urlString),
+              url.scheme == "experiencesampling" else { return }
+
+        switch url.host {
+        case "start-pomodoro":
+            if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+               let taskItem = components.queryItems?.first(where: { $0.name == "task" }),
+               let task = taskItem.value, !task.isEmpty {
+                if pomodoroScheduler.phase != .idle {
+                    pomodoroScheduler.abandon()
+                }
+                pomodoroScheduler.startWork(task: task)
+            } else {
+                showPomodoroTaskInput()
+            }
+        default:
+            break
+        }
     }
 
     private func setupStatusItem() {
@@ -972,12 +1006,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = CombinedStartOfDayView(
             onStartPomodoro: { [weak self] excitement in
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
+                self?.wakeDetector.markTodayAsPrompted()
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.promptWindow?.close()
                 self?.showPomodoroTaskInput()
             },
             onSnooze: { [weak self] excitement in
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
+                self?.wakeDetector.markTodayAsPrompted()
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.pomodoroScheduler.scheduleSnooze()
                 self?.promptWindow?.close()
@@ -988,11 +1024,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showPomodoroTaskInput() {
         var presented = true
-        let view = PomodoroTaskInputView(isPresented: Binding(get: { presented }, set: { [weak self] v in
-            presented = v; if !v { self?.promptWindow?.close() }
-        })) { [weak self] task in
-            self?.pomodoroScheduler.startWork(task: task)
-        }
+        let view = PomodoroTaskInputView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.promptWindow?.close() }
+            }),
+            onStart: { [weak self] task in
+                self?.pomodoroScheduler.startWork(task: task)
+            },
+            onSnooze: { [weak self] in
+                self?.pomodoroScheduler.scheduleSnooze()
+            }
+        )
         showWindow(view)
     }
 
