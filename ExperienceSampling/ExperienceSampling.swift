@@ -51,8 +51,13 @@ final class DataStore {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode([Response].self, from: data) else {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            responses = []
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode([Response].self, from: data) else {
             responses = []
             return
         }
@@ -106,8 +111,13 @@ final class PomodoroDataStore {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let decoded = try? JSONDecoder().decode([PomodoroSession].self, from: data) else {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            sessions = []
+            return
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let decoded = try? decoder.decode([PomodoroSession].self, from: data) else {
             sessions = []
             return
         }
@@ -217,9 +227,11 @@ final class PomodoroScheduler: ObservableObject {
     var shortBreakDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroShortBreak").nonZeroOr(5) }
     var longBreakDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroLongBreak").nonZeroOr(15) }
     var snoozeDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroSnooze").nonZeroOr(30) }
+    var breakSnoozeDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroBreakSnooze").nonZeroOr(5) }
 
     private var displayTimer: Timer?
     private var snoozeTimer: Timer?
+    private var breakSnoozeTimer: Timer?
 
     private let phaseKey = "pomodoroPhase"
     private let phaseStartKey = "pomodoroPhaseStart"
@@ -231,6 +243,7 @@ final class PomodoroScheduler: ObservableObject {
     var onWorkSessionEnd: (() -> Void)?
     var onBreakEnd: (() -> Void)?
     var onSnoozeEnd: (() -> Void)?
+    var onBreakSnoozeEnd: (() -> Void)?
 
     init() {
         pomodoroCount = UserDefaults.standard.integer(forKey: countKey)
@@ -303,27 +316,15 @@ final class PomodoroScheduler: ObservableObject {
         startDisplayTimer()
     }
 
-    func skipBreak() {
-        phase = .idle
-        stopDisplayTimer()
-        clearSavedState()
-        onTimerTick?(0, .idle)
-    }
-
     func abandon() {
         phase = .idle
         stopDisplayTimer()
         snoozeTimer?.invalidate()
         snoozeTimer = nil
+        breakSnoozeTimer?.invalidate()
+        breakSnoozeTimer = nil
         clearSavedState()
         PomodoroDataStore.shared.updateLast(endTime: Date(), completed: false)
-        onTimerTick?(0, .idle)
-    }
-
-    func endForNow() {
-        phase = .idle
-        stopDisplayTimer()
-        clearSavedState()
         onTimerTick?(0, .idle)
     }
 
@@ -331,6 +332,13 @@ final class PomodoroScheduler: ObservableObject {
         snoozeTimer?.invalidate()
         snoozeTimer = Timer.scheduledTimer(withTimeInterval: Double(snoozeDuration * 60), repeats: false) { [weak self] _ in
             self?.onSnoozeEnd?()
+        }
+    }
+
+    func scheduleBreakSnooze() {
+        breakSnoozeTimer?.invalidate()
+        breakSnoozeTimer = Timer.scheduledTimer(withTimeInterval: Double(breakSnoozeDuration * 60), repeats: false) { [weak self] _ in
+            self?.onBreakSnoozeEnd?()
         }
     }
 
@@ -471,7 +479,7 @@ struct LikertScale: View {
 
 enum StartOfDayFocus: Hashable {
     case scale
-    case dismiss
+    case snooze
     case submit
 }
 
@@ -480,6 +488,7 @@ struct StartOfDayView: View {
     @State private var excitement: Int? = nil
     @FocusState private var focus: StartOfDayFocus?
     var onSubmit: (Int) -> Void
+    var onSnooze: () -> Void
 
     var body: some View {
         VStack(spacing: 20) {
@@ -489,9 +498,9 @@ struct StartOfDayView: View {
                 .focusable()
                 .focused($focus, equals: .scale)
             HStack(spacing: 12) {
-                Button("Dismiss") { isPresented = false }
+                Button("Snooze 30 min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .dismiss)
+                    .focused($focus, equals: .snooze)
                 Button("Submit") {
                     if let v = excitement { onSubmit(v); isPresented = false }
                 }
@@ -513,7 +522,7 @@ struct StartOfDayView: View {
 enum IntradayFocus: Hashable {
     case activity
     case scale
-    case dismiss
+    case snooze
     case submit
 }
 
@@ -523,6 +532,7 @@ struct IntradayView: View {
     @State private var excitement: Int? = nil
     @FocusState private var focus: IntradayFocus?
     var onSubmit: (String, Int) -> Void
+    var onSnooze: () -> Void
 
     private var isValid: Bool { !activity.trimmingCharacters(in: .whitespaces).isEmpty && excitement != nil }
 
@@ -548,9 +558,9 @@ struct IntradayView: View {
             }
 
             HStack(spacing: 12) {
-                Button("Dismiss") { isPresented = false }
+                Button("Snooze 30 min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .dismiss)
+                    .focused($focus, equals: .snooze)
                 Button("Submit") {
                     if isValid, let e = excitement { onSubmit(activity.trimmingCharacters(in: .whitespaces), e); isPresented = false }
                 }
@@ -610,6 +620,7 @@ struct SettingsView: View {
     @AppStorage("pomodoroShortBreak") private var shortBreak = 5
     @AppStorage("pomodoroLongBreak") private var longBreak = 15
     @AppStorage("pomodoroSnooze") private var snooze = 30
+    @AppStorage("pomodoroBreakSnooze") private var breakSnooze = 5
 
     @State private var selectedTab = 0
 
@@ -632,6 +643,7 @@ struct SettingsView: View {
                 Stepper("Short break: \(shortBreak) min", value: $shortBreak, in: 1...30)
                 Stepper("Long break: \(longBreak) min", value: $longBreak, in: 5...60)
                 Stepper("Snooze: \(snooze) min", value: $snooze, in: 5...120)
+                Stepper("Break snooze: \(breakSnooze) min", value: $breakSnooze, in: 1...30)
             }
             .tabItem { Label("Pomodoro", systemImage: "timer") }
             .tag(1)
@@ -734,7 +746,7 @@ struct PomodoroTaskInputView: View {
 }
 
 enum BreakFocus: Hashable {
-    case skip
+    case snooze
     case start
 }
 
@@ -744,7 +756,7 @@ struct PomodoroBreakView: View {
     let breakDuration: Int
     @FocusState private var focus: BreakFocus?
     var onStartBreak: () -> Void
-    var onSkipBreak: () -> Void
+    var onSnooze: () -> Void
 
     var body: some View {
         VStack(spacing: 20) {
@@ -752,9 +764,9 @@ struct PomodoroBreakView: View {
             Text("Great work! Time for a \(isLongBreak ? "long" : "short") break.")
             Text("\(breakDuration) minutes").font(.title).fontWeight(.medium)
             HStack(spacing: 12) {
-                Button("Skip break") { onSkipBreak(); isPresented = false }
+                Button("Snooze 30 min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .skip)
+                    .focused($focus, equals: .snooze)
                 Button("Start break") { onStartBreak(); isPresented = false }
                     .keyboardShortcut(.return, modifiers: [])
                     .buttonStyle(.borderedProminent)
@@ -772,7 +784,7 @@ struct PomodoroBreakView: View {
 
 enum NextFocus: Hashable {
     case task
-    case endForNow
+    case snooze
     case startNext
 }
 
@@ -781,7 +793,7 @@ struct PomodoroNextView: View {
     @State private var task: String = ""
     @FocusState private var focus: NextFocus?
     var onStartNext: (String) -> Void
-    var onEndForNow: () -> Void
+    var onSnooze: () -> Void
 
     private var isValid: Bool { !task.trimmingCharacters(in: .whitespaces).isEmpty }
 
@@ -797,9 +809,9 @@ struct PomodoroNextView: View {
                     .onSubmit { if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
             }
             HStack(spacing: 12) {
-                Button("End for now") { onEndForNow(); isPresented = false }
+                Button("Snooze 30 min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .endForNow)
+                    .focused($focus, equals: .snooze)
                 Button("Start Pomodoro") {
                     if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false }
                 }
@@ -862,6 +874,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let wakeDetector = WakeDetector()
     private let pomodoroScheduler = PomodoroScheduler()
     private var abandonMenuItem: NSMenuItem?
+    private var currentTaskMenuItem: NSMenuItem?
+    private var startOfDaySnoozeTimer: Timer?
+    private var intradaySnoozeTimer: Timer?
+    private let snoozeDuration: TimeInterval = 30 * 60
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -881,6 +897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pomodoroScheduler.onWorkSessionEnd = { [weak self] in self?.showPomodoroBreak() }
         pomodoroScheduler.onBreakEnd = { [weak self] in self?.showPomodoroNext() }
         pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInput() }
+        pomodoroScheduler.onBreakSnoozeEnd = { [weak self] in self?.showPomodoroBreak() }
 
         pomodoroScheduler.restoreState()
         wakeDetector.checkForNewDay()
@@ -924,6 +941,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(title: "Start Pomodoro", action: #selector(showPomodoroTaskInput), keyEquivalent: "p"))
+        let currentTask = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        currentTask.isEnabled = false
+        currentTask.isHidden = true
+        currentTaskMenuItem = currentTask
+        menu.addItem(currentTask)
         let abandon = NSMenuItem(title: "Abandon Pomodoro", action: #selector(abandonPomodoro), keyEquivalent: "")
         abandon.isEnabled = false
         abandonMenuItem = abandon
@@ -953,23 +975,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateMenuBarForPomodoro(seconds: Int, phase: PomodoroPhase) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let task = self.pomodoroScheduler.currentTask
             switch phase {
             case .idle:
                 self.statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: "Experience Sampling")
                 self.statusItem.button?.title = ""
+                self.statusItem.button?.toolTip = nil
                 self.abandonMenuItem?.isEnabled = false
+                self.currentTaskMenuItem?.isHidden = true
             case .work:
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
                 let secs = seconds % 60
                 self.statusItem.button?.title = String(format: "🍅 %02d:%02d", mins, secs)
+                self.statusItem.button?.toolTip = task.isEmpty ? nil : "Goal: \(task)"
                 self.abandonMenuItem?.isEnabled = true
+                self.currentTaskMenuItem?.title = "Goal: \(task)"
+                self.currentTaskMenuItem?.isHidden = task.isEmpty
             case .shortBreak, .longBreak:
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
                 let secs = seconds % 60
                 self.statusItem.button?.title = String(format: "☕️ %02d:%02d", mins, secs)
+                self.statusItem.button?.toolTip = "On break"
                 self.abandonMenuItem?.isEnabled = false
+                self.currentTaskMenuItem?.isHidden = true
             }
         }
     }
@@ -992,13 +1022,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showStartOfDayPrompt() {
+        startOfDaySnoozeTimer?.invalidate()
         var presented = true
-        let view = StartOfDayView(isPresented: Binding(get: { presented }, set: { [weak self] v in
-            presented = v; if !v { self?.promptWindow?.close() }
-        })) { [weak self] excitement in
-            DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
-            self?.wakeDetector.markTodayAsPrompted()
-        }
+        let view = StartOfDayView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.promptWindow?.close() }
+            }),
+            onSubmit: { [weak self] excitement in
+                DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
+                self?.wakeDetector.markTodayAsPrompted()
+            },
+            onSnooze: { [weak self] in
+                self?.startOfDaySnoozeTimer = Timer.scheduledTimer(withTimeInterval: self?.snoozeDuration ?? 1800, repeats: false) { _ in
+                    self?.showStartOfDayPrompt()
+                }
+            }
+        )
         showWindow(view)
     }
 
@@ -1049,7 +1088,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isLongBreak: isLong,
             breakDuration: duration,
             onStartBreak: { [weak self] in self?.pomodoroScheduler.startBreak(isLong: isLong) },
-            onSkipBreak: { [weak self] in self?.pomodoroScheduler.skipBreak() }
+            onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleBreakSnooze() }
         )
         showWindow(view)
     }
@@ -1061,7 +1100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 presented = v; if !v { self?.promptWindow?.close() }
             }),
             onStartNext: { [weak self] task in self?.pomodoroScheduler.startWork(task: task) },
-            onEndForNow: { [weak self] in self?.pomodoroScheduler.endForNow() }
+            onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() }
         )
         showWindow(view)
     }
@@ -1074,12 +1113,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hour = Calendar.current.component(.hour, from: Date())
         guard hour >= scheduler.workingHoursStart && hour < scheduler.workingHoursEnd else { return }
 
+        intradaySnoozeTimer?.invalidate()
         var presented = true
-        let view = IntradayView(isPresented: Binding(get: { presented }, set: { [weak self] v in
-            presented = v; if !v { self?.promptWindow?.close() }
-        })) { activity, excitement in
-            DataStore.shared.add(Response(timestamp: Date(), type: .intraday, excitement: excitement, activity: activity))
-        }
+        let view = IntradayView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.promptWindow?.close() }
+            }),
+            onSubmit: { activity, excitement in
+                DataStore.shared.add(Response(timestamp: Date(), type: .intraday, excitement: excitement, activity: activity))
+            },
+            onSnooze: { [weak self] in
+                self?.intradaySnoozeTimer = Timer.scheduledTimer(withTimeInterval: self?.snoozeDuration ?? 1800, repeats: false) { _ in
+                    self?.showIntradayPrompt()
+                }
+            }
+        )
         showWindow(view)
     }
 
