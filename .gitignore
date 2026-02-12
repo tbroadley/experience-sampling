@@ -16,3 +16,5 @@ DerivedData/
 
 # Local config
 .env
+
+build
