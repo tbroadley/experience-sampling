@@ -383,9 +383,7 @@ final class PomodoroScheduler: ObservableObject {
 // MARK: - Wake Detector
 
 final class WakeDetector {
-    private let lastPromptDateKey = "lastStartOfDayPromptDate"
     private let lastPomodoroPromptDateKey = "lastPomodoroStartOfDayPromptDate"
-    var onNewDayDetected: (() -> Void)?
     var onNewPomodoroDay: (() -> Void)?
     var shouldSuppressPomodoroPrompt: (() -> Bool)?
 
@@ -408,10 +406,6 @@ final class WakeDetector {
         // Only show "Good morning" prompts before noon
         guard hour < 12 else { return }
 
-        let lastDate = UserDefaults.standard.object(forKey: lastPromptDateKey) as? Date
-        let lastDay = lastDate.map { calendar.startOfDay(for: $0) }
-        if lastDay != today { onNewDayDetected?() }
-
         let lastPomodoroDate = UserDefaults.standard.object(forKey: lastPomodoroPromptDateKey) as? Date
         let lastPomodoroDay = lastPomodoroDate.map { calendar.startOfDay(for: $0) }
         if lastPomodoroDay != today && shouldSuppressPomodoroPrompt?() != true {
@@ -419,16 +413,8 @@ final class WakeDetector {
         }
     }
 
-    func markTodayAsPrompted() {
-        UserDefaults.standard.set(Date(), forKey: lastPromptDateKey)
-    }
-
     func markPomodoroPrompted() {
         UserDefaults.standard.set(Date(), forKey: lastPomodoroPromptDateKey)
-    }
-
-    func reset() {
-        UserDefaults.standard.removeObject(forKey: lastPromptDateKey)
     }
 
     func resetPomodoro() {
@@ -473,48 +459,6 @@ struct LikertScale: View {
             if isFocused {
                 Text("Press 1-7 to select").font(.caption2).foregroundColor(.secondary)
             }
-        }
-    }
-}
-
-enum StartOfDayFocus: Hashable {
-    case scale
-    case snooze
-    case submit
-}
-
-struct StartOfDayView: View {
-    @Binding var isPresented: Bool
-    @State private var excitement: Int? = nil
-    @FocusState private var focus: StartOfDayFocus?
-    var onSubmit: (Int) -> Void
-    var onSnooze: () -> Void
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Good morning!").font(.title2).fontWeight(.semibold)
-            Text("How excited are you to start working today?")
-            LikertScale(selectedValue: $excitement, isFocused: focus == .scale)
-                .focusable()
-                .focused($focus, equals: .scale)
-            HStack(spacing: 12) {
-                Button("Snooze 30 min") { onSnooze(); isPresented = false }
-                    .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .snooze)
-                Button("Submit") {
-                    if let v = excitement { onSubmit(v); isPresented = false }
-                }
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(excitement == nil)
-                .buttonStyle(.borderedProminent)
-                .focused($focus, equals: .submit)
-            }
-        }
-        .padding(24)
-        .frame(width: 320)
-        .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
-            focus = .scale
         }
     }
 }
@@ -875,7 +819,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let pomodoroScheduler = PomodoroScheduler()
     private var abandonMenuItem: NSMenuItem?
     private var currentTaskMenuItem: NSMenuItem?
-    private var startOfDaySnoozeTimer: Timer?
     private var intradaySnoozeTimer: Timer?
     private let snoozeDuration: TimeInterval = 30 * 60
 
@@ -885,7 +828,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduler.onPromptTriggered = { [weak self] in self?.showIntradayPrompt() }
         scheduler.start()
 
-        wakeDetector.onNewDayDetected = { [weak self] in self?.showStartOfDayPrompt() }
         wakeDetector.onNewPomodoroDay = { [weak self] in self?.showPomodoroStartOfDay() }
         wakeDetector.shouldSuppressPomodoroPrompt = { [weak self] in
             self?.pomodoroScheduler.phase != .idle
@@ -959,9 +901,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         let debug = NSMenu()
-        debug.addItem(NSMenuItem(title: "Show Start of Day", action: #selector(showStartOfDayPrompt), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Show Pomodoro Start", action: #selector(showPomodoroStartOfDay), keyEquivalent: ""))
-        debug.addItem(NSMenuItem(title: "Reset Start of Day", action: #selector(resetStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         let debugItem = NSMenuItem(title: "Debug", action: nil, keyEquivalent: "")
         debugItem.submenu = debug
@@ -1021,38 +961,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func showStartOfDayPrompt() {
-        startOfDaySnoozeTimer?.invalidate()
-        var presented = true
-        let view = StartOfDayView(
-            isPresented: Binding(get: { presented }, set: { [weak self] v in
-                presented = v; if !v { self?.promptWindow?.close() }
-            }),
-            onSubmit: { [weak self] excitement in
-                DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
-                self?.wakeDetector.markTodayAsPrompted()
-            },
-            onSnooze: { [weak self] in
-                self?.startOfDaySnoozeTimer = Timer.scheduledTimer(withTimeInterval: self?.snoozeDuration ?? 1800, repeats: false) { _ in
-                    self?.showStartOfDayPrompt()
-                }
-            }
-        )
-        showWindow(view)
-    }
-
     @objc private func showPomodoroStartOfDay() {
         let view = CombinedStartOfDayView(
             onStartPomodoro: { [weak self] excitement in
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
-                self?.wakeDetector.markTodayAsPrompted()
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.promptWindow?.close()
                 self?.showPomodoroTaskInput()
             },
             onSnooze: { [weak self] excitement in
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
-                self?.wakeDetector.markTodayAsPrompted()
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.pomodoroScheduler.scheduleSnooze()
                 self?.promptWindow?.close()
@@ -1134,7 +1052,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showHistory() { showWindow(HistoryView()) }
     @objc private func showPomodoroHistory() { showWindow(PomodoroHistoryView()) }
     @objc private func showSettings() { showWindow(SettingsView()) }
-    @objc private func resetStartOfDay() { wakeDetector.reset() }
     @objc private func resetPomodoroStartOfDay() { wakeDetector.resetPomodoro() }
 
     @objc private func exportData() {
