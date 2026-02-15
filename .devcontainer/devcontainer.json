@@ -1,0 +1,12 @@
+{
+  "name": "Experience Sampling (Swift)",
+  "image": "swift:6.0",
+  "postCreateCommand": "apt-get update && apt-get install -y wget curl && rm -rf /var/lib/apt/lists/*",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "sswg.swift-lang"
+      ]
+    }
+  }
+}
