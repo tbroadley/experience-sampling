@@ -171,47 +171,95 @@ final class PomodoroDataStore {
 // MARK: - Prompt Scheduler
 
 final class PromptScheduler: ObservableObject {
-    private var timer: Timer?
+    private var timers: [Timer] = []
+    private var wakeObservers: [Any] = []
     var onPromptTriggered: (() -> Void)?
 
     var workingHoursStart: Int { UserDefaults.standard.integer(forKey: "workingHoursStart").nonZeroOr(9) }
     var workingHoursEnd: Int { UserDefaults.standard.integer(forKey: "workingHoursEnd").nonZeroOr(17) }
     var averagePromptsPerDay: Double { UserDefaults.standard.double(forKey: "averagePromptsPerDay").nonZeroOr(3.0) }
 
-    func start() { scheduleNextPrompt() }
-    func stop() { timer?.invalidate(); timer = nil }
+    func start() {
+        schedulePromptsForToday()
+        let nc = NSWorkspace.shared.notificationCenter
+        wakeObservers = [
+            nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.schedulePromptsForToday()
+            },
+            nc.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.schedulePromptsForToday()
+            }
+        ]
+    }
 
-    func scheduleNextPrompt() {
-        timer?.invalidate()
+    func stop() {
+        timers.forEach { $0.invalidate() }
+        timers = []
+        let nc = NSWorkspace.shared.notificationCenter
+        wakeObservers.forEach { nc.removeObserver($0) }
+        wakeObservers = []
+    }
 
+    private func schedulePromptsForToday() {
+        timers.forEach { $0.invalidate() }
+        timers = []
+
+        let calendar = Calendar.current
         let now = Date()
-        let hour = Calendar.current.component(.hour, from: now)
+        let today = calendar.startOfDay(for: now)
 
-        guard hour >= workingHoursStart && hour < workingHoursEnd else {
-            scheduleWorkingHoursCheck()
+        let startOfWork = calendar.date(bySettingHour: workingHoursStart, minute: 0, second: 0, of: today)!
+        let endOfWork = calendar.date(bySettingHour: workingHoursEnd, minute: 0, second: 0, of: today)!
+
+        let effectiveStart = max(now, startOfWork)
+        guard effectiveStart < endOfWork else {
+            scheduleNextDayStart()
             return
         }
 
-        let workingMinutes = Double(workingHoursEnd - workingHoursStart) * 60.0
-        let lambda = averagePromptsPerDay / workingMinutes
-        let u = Double.random(in: Double.ulpOfOne..<1)
-        let intervalMinutes = min(max(-log(u) / lambda, 10), 240)
+        let totalWorkingSeconds = endOfWork.timeIntervalSince(startOfWork)
+        let remainingSeconds = endOfWork.timeIntervalSince(effectiveStart)
+        let remainingFraction = remainingSeconds / totalWorkingSeconds
+        let promptCount = max(Int(round(averagePromptsPerDay * remainingFraction)), 0)
 
-        timer = Timer.scheduledTimer(withTimeInterval: intervalMinutes * 60, repeats: false) { [weak self] _ in
-            self?.onPromptTriggered?()
-            self?.scheduleNextPrompt()
+        if promptCount > 0 {
+            var promptTimes: [Date] = (0..<promptCount).map { _ in
+                effectiveStart.addingTimeInterval(Double.random(in: 0..<remainingSeconds))
+            }.sorted()
+
+            let minGap: TimeInterval = 10 * 60
+            for i in 1..<promptTimes.count {
+                if promptTimes[i].timeIntervalSince(promptTimes[i - 1]) < minGap {
+                    promptTimes[i] = promptTimes[i - 1].addingTimeInterval(minGap)
+                }
+            }
+
+            for time in promptTimes where time < endOfWork {
+                let interval = time.timeIntervalSince(now)
+                guard interval > 0 else { continue }
+                let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+                    self?.onPromptTriggered?()
+                }
+                timers.append(timer)
+            }
         }
+
+        let endTimer = Timer.scheduledTimer(withTimeInterval: endOfWork.timeIntervalSince(now) + 1, repeats: false) { [weak self] _ in
+            self?.scheduleNextDayStart()
+        }
+        timers.append(endTimer)
     }
 
-    private func scheduleWorkingHoursCheck() {
+    private func scheduleNextDayStart() {
         let calendar = Calendar.current
         let now = Date()
         var nextStart = calendar.date(bySettingHour: workingHoursStart, minute: 0, second: 0, of: now)!
         if nextStart <= now { nextStart = calendar.date(byAdding: .day, value: 1, to: nextStart)! }
 
-        timer = Timer.scheduledTimer(withTimeInterval: nextStart.timeIntervalSince(now), repeats: false) { [weak self] _ in
-            self?.scheduleNextPrompt()
+        let timer = Timer.scheduledTimer(withTimeInterval: nextStart.timeIntervalSince(now), repeats: false) { [weak self] _ in
+            self?.schedulePromptsForToday()
         }
+        timers.append(timer)
     }
 }
 
