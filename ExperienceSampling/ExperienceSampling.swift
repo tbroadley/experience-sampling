@@ -656,6 +656,7 @@ enum CombinedStartFocus: Hashable {
 struct CombinedStartOfDayView: View {
     @State private var excitement: Int? = nil
     @FocusState private var focus: CombinedStartFocus?
+    var snoozeDuration: Int
     var onStartPomodoro: (Int) -> Void
     var onSnooze: (Int) -> Void
 
@@ -667,7 +668,7 @@ struct CombinedStartOfDayView: View {
                 .focusable()
                 .focused($focus, equals: .scale)
             HStack(spacing: 12) {
-                Button("Snooze 30 min") {
+                Button("Snooze \(snoozeDuration) min") {
                     if let v = excitement { onSnooze(v) }
                 }
                 .disabled(excitement == nil)
@@ -700,6 +701,7 @@ struct PomodoroTaskInputView: View {
     @Binding var isPresented: Bool
     @State private var task: String = ""
     @FocusState private var focus: TaskInputFocus?
+    var snoozeDuration: Int
     var onStart: (String) -> Void
     var onSnooze: () -> Void
 
@@ -716,7 +718,7 @@ struct PomodoroTaskInputView: View {
                     .onSubmit { if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
             }
             HStack(spacing: 12) {
-                Button("Snooze 30 min") { onSnooze(); isPresented = false }
+                Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
                     .focused($focus, equals: .snooze)
                 Button("Start") {
@@ -746,6 +748,7 @@ struct PomodoroBreakView: View {
     @Binding var isPresented: Bool
     let isLongBreak: Bool
     let breakDuration: Int
+    let snoozeDuration: Int
     @FocusState private var focus: BreakFocus?
     var onStartBreak: () -> Void
     var onSnooze: () -> Void
@@ -756,7 +759,7 @@ struct PomodoroBreakView: View {
             Text("Great work! Time for a \(isLongBreak ? "long" : "short") break.")
             Text("\(breakDuration) minutes").font(.title).fontWeight(.medium)
             HStack(spacing: 12) {
-                Button("Snooze 30 min") { onSnooze(); isPresented = false }
+                Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
                     .focused($focus, equals: .snooze)
                 Button("Start break") { onStartBreak(); isPresented = false }
@@ -784,6 +787,7 @@ struct PomodoroNextView: View {
     @Binding var isPresented: Bool
     @State private var task: String = ""
     @FocusState private var focus: NextFocus?
+    var snoozeDuration: Int
     var onStartNext: (String) -> Void
     var onSnooze: () -> Void
 
@@ -801,7 +805,7 @@ struct PomodoroNextView: View {
                     .onSubmit { if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
             }
             HStack(spacing: 12) {
-                Button("Snooze 30 min") { onSnooze(); isPresented = false }
+                Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
                     .focused($focus, equals: .snooze)
                 Button("Start Pomodoro") {
@@ -1011,6 +1015,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showPomodoroStartOfDay() {
         let view = CombinedStartOfDayView(
+            snoozeDuration: pomodoroScheduler.snoozeDuration,
             onStartPomodoro: { [weak self] excitement in
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
                 self?.wakeDetector.markPomodoroPrompted()
@@ -1033,6 +1038,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
             }),
+            snoozeDuration: pomodoroScheduler.snoozeDuration,
             onStart: { [weak self] task in
                 self?.pomodoroScheduler.startWork(task: task)
             },
@@ -1053,6 +1059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }),
             isLongBreak: isLong,
             breakDuration: duration,
+            snoozeDuration: pomodoroScheduler.breakSnoozeDuration,
             onStartBreak: { [weak self] in self?.pomodoroScheduler.startBreak(isLong: isLong) },
             onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleBreakSnooze() }
         )
@@ -1065,6 +1072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
             }),
+            snoozeDuration: pomodoroScheduler.snoozeDuration,
             onStartNext: { [weak self] task in self?.pomodoroScheduler.startWork(task: task) },
             onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() }
         )
