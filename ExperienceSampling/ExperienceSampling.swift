@@ -341,6 +341,8 @@ final class PomodoroScheduler: ObservableObject {
     }
 
     func startWork(task: String) {
+        snoozeTimer?.invalidate()
+        snoozeTimer = nil
         currentTask = task
         pomodoroCount = (pomodoroCount % 4) + 1
         phase = .work
@@ -1033,6 +1035,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showPomodoroTaskInput() {
+        guard pomodoroScheduler.phase == .idle else { return }
         var presented = true
         let view = PomodoroTaskInputView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
