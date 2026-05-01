@@ -498,6 +498,7 @@ struct CalendarEvent {
     let start: Date
     let end: Date
     let meetLink: String?
+    let declined: Bool
 }
 
 final class CalendarMonitor {
@@ -522,18 +523,20 @@ final class CalendarMonitor {
         meetLinkTimers = []
     }
 
+    private var acceptedEvents: [CalendarEvent] { events.filter { !$0.declined } }
+
     func isInMeeting(at date: Date = Date()) -> Bool {
-        events.contains { date >= $0.start && date < $0.end }
+        acceptedEvents.contains { date >= $0.start && date < $0.end }
     }
 
     func minutesUntilNextMeeting(from date: Date = Date()) -> Int? {
-        let upcoming = events.filter { $0.start > date }.sorted { $0.start < $1.start }
+        let upcoming = acceptedEvents.filter { $0.start > date }.sorted { $0.start < $1.start }
         guard let next = upcoming.first else { return nil }
         return Int(next.start.timeIntervalSince(date) / 60)
     }
 
     func currentMeetingEnd(at date: Date = Date()) -> Date? {
-        events.first { date >= $0.start && date < $0.end }?.end
+        acceptedEvents.first { date >= $0.start && date < $0.end }?.end
     }
 
     func refresh() {
@@ -582,7 +585,9 @@ final class CalendarMonitor {
                 let videoEntry = (((item["conferenceData"] as? [String: Any])?["entryPoints"] as? [[String: Any]])?
                     .first { $0["entryPointType"] as? String == "video" })?["uri"] as? String
                 let meetLink = hangout ?? videoEntry
-                return CalendarEvent(summary: summary, start: start, end: end, meetLink: meetLink)
+                let attendees = item["attendees"] as? [[String: Any]] ?? []
+                let declined = attendees.first { $0["self"] as? Bool == true }?["responseStatus"] as? String == "declined"
+                return CalendarEvent(summary: summary, start: start, end: end, meetLink: meetLink, declined: declined)
             }
 
             DispatchQueue.main.async {
@@ -597,7 +602,7 @@ final class CalendarMonitor {
         meetLinkTimers = []
 
         let now = Date()
-        for event in events {
+        for event in acceptedEvents {
             guard let link = event.meetLink, !link.isEmpty else { continue }
 
             let openKey = "\(link)_\(event.start.timeIntervalSince1970)"
@@ -1467,7 +1472,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.showPomodoroBreak()
         }
         pomodoroScheduler.onBreakEnd = { [weak self] in self?.showPomodoroNext() }
-        pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInput() }
+        pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInputDeferred() }
         pomodoroScheduler.onBreakSnoozeEnd = { [weak self] in self?.showPomodoroBreak() }
         pomodoroScheduler.onWorkStart = { [weak self] task in
             self?.focusMonitor.start(task: task)
@@ -1659,28 +1664,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showPomodoroTaskInput() {
+        presentPomodoroTaskInput()
+    }
+
+    private func showPomodoroTaskInputDeferred() {
         guard pomodoroScheduler.phase == .idle else { return }
-        deferIfMeeting { [weak self] in
-            guard let self else { return }
-            let workMins = self.availableWorkMinutes()
-            let defaultDuration = self.pomodoroScheduler.workDuration
-            var presented = true
-            let view = PomodoroTaskInputView(
-                isPresented: Binding(get: { presented }, set: { [weak self] v in
-                    presented = v; if !v { self?.promptWindow?.close() }
-                }),
-                snoozeDuration: self.pomodoroScheduler.snoozeDuration,
-                workMinutes: workMins < defaultDuration ? workMins : nil,
-                onStart: { [weak self] task in
-                    self?.pomodoroScheduler.workDurationOverride = workMins
-                    self?.pomodoroScheduler.startWork(task: task)
-                },
-                onSnooze: { [weak self] in
-                    self?.pomodoroScheduler.scheduleSnooze()
-                }
-            )
-            self.showWindow(view)
-        }
+        deferIfMeeting { [weak self] in self?.presentPomodoroTaskInput() }
+    }
+
+    private func presentPomodoroTaskInput() {
+        guard pomodoroScheduler.phase == .idle else { return }
+        let workMins = availableWorkMinutes()
+        let defaultDuration = pomodoroScheduler.workDuration
+        var presented = true
+        let view = PomodoroTaskInputView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.promptWindow?.close() }
+            }),
+            snoozeDuration: pomodoroScheduler.snoozeDuration,
+            workMinutes: workMins < defaultDuration ? workMins : nil,
+            onStart: { [weak self] task in
+                self?.pomodoroScheduler.workDurationOverride = workMins
+                self?.pomodoroScheduler.startWork(task: task)
+            },
+            onSnooze: { [weak self] in
+                self?.pomodoroScheduler.scheduleSnooze()
+            }
+        )
+        showWindow(view)
     }
 
     private func showPomodoroBreak() {
