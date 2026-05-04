@@ -549,12 +549,19 @@ final class CalendarMonitor {
             return
         }
         let meetingKey = "\(meeting.start.timeIntervalSince1970)"
-        guard !earlyExitMeetings.contains(meetingKey) else { return }
+        let avActive = Self.isCameraRunning() || Self.isMicRunning()
+
+        if earlyExitMeetings.contains(meetingKey) {
+            if avActive {
+                earlyExitMeetings.remove(meetingKey)
+                avInactiveCount = 0
+            }
+            return
+        }
 
         let elapsed = now.timeIntervalSince(meeting.start)
         guard elapsed > 120 else { return }
 
-        let avActive = Self.isCameraRunning() || Self.isMicRunning()
         if avActive {
             avInactiveCount = 0
         } else {
