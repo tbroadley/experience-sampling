@@ -585,6 +585,8 @@ final class CalendarMonitor {
                 let videoEntry = (((item["conferenceData"] as? [String: Any])?["entryPoints"] as? [[String: Any]])?
                     .first { $0["entryPointType"] as? String == "video" })?["uri"] as? String
                 let meetLink = hangout ?? videoEntry
+                let eventType = item["eventType"] as? String ?? "default"
+                if eventType != "default" { return nil }
                 let attendees = item["attendees"] as? [[String: Any]] ?? []
                 let declined = attendees.first { $0["self"] as? Bool == true }?["responseStatus"] as? String == "declined"
                 return CalendarEvent(summary: summary, start: start, end: end, meetLink: meetLink, declined: declined)
@@ -1622,8 +1624,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
                     self?.deferIfMeeting(action: action)
                 }
+                return
             }
-            return
         }
 
         if let minsUntil = calendarMonitor.minutesUntilNextMeeting(), minsUntil < minPomodoroDuration + meetingBuffer {
