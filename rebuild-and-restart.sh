@@ -43,7 +43,7 @@ fi
 
 echo "==> Rebuilding binary into temporary bundle"
 mkdir -p "$(dirname "$TMP_BIN")"
-swiftc -O -framework AppKit -framework SwiftUI "$SRC_FILE" -o "$TMP_BIN"
+swiftc -O -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio "$SRC_FILE" -o "$TMP_BIN"
 
 echo "==> Codesigning temporary app bundle"
 codesign --force --sign "$CODESIGN_CERT" "$TMP_APP"

@@ -1,4 +1,6 @@
 import AppKit
+import CoreAudio
+import CoreMediaIO
 import SwiftUI
 
 // MARK: - Data Model
@@ -506,19 +508,28 @@ final class CalendarMonitor {
     private var refreshTimer: Timer?
     private var meetLinkTimers: [Timer] = []
     private var openedMeetLinks: Set<String> = []
+    private var avInactiveCount = 0
+    private var earlyExitMeetings: Set<String> = []
+    private var avCheckTimer: Timer?
     private let refreshInterval: TimeInterval = 5 * 60
     private let meetOpenBuffer: TimeInterval = 60
+    private let avChecksBeforeEarlyExit = 2
 
     func start() {
         refresh()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        avCheckTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.checkAVForEarlyExit()
+        }
     }
 
     func stop() {
         refreshTimer?.invalidate()
         refreshTimer = nil
+        avCheckTimer?.invalidate()
+        avCheckTimer = nil
         meetLinkTimers.forEach { $0.invalidate() }
         meetLinkTimers = []
     }
@@ -526,7 +537,96 @@ final class CalendarMonitor {
     private var acceptedEvents: [CalendarEvent] { events.filter { !$0.declined } }
 
     func isInMeeting(at date: Date = Date()) -> Bool {
-        acceptedEvents.contains { date >= $0.start && date < $0.end }
+        guard let meeting = acceptedEvents.first(where: { date >= $0.start && date < $0.end }) else { return false }
+        let meetingKey = "\(meeting.start.timeIntervalSince1970)"
+        return !earlyExitMeetings.contains(meetingKey)
+    }
+
+    private func checkAVForEarlyExit() {
+        let now = Date()
+        guard let meeting = acceptedEvents.first(where: { now >= $0.start && now < $0.end }) else {
+            avInactiveCount = 0
+            return
+        }
+        let meetingKey = "\(meeting.start.timeIntervalSince1970)"
+        guard !earlyExitMeetings.contains(meetingKey) else { return }
+
+        let elapsed = now.timeIntervalSince(meeting.start)
+        guard elapsed > 120 else { return }
+
+        let avActive = Self.isCameraRunning() || Self.isMicRunning()
+        if avActive {
+            avInactiveCount = 0
+        } else {
+            avInactiveCount += 1
+            if avInactiveCount >= avChecksBeforeEarlyExit {
+                earlyExitMeetings.insert(meetingKey)
+                avInactiveCount = 0
+            }
+        }
+    }
+
+    static func isCameraRunning() -> Bool {
+        var propertyAddress = CMIOObjectPropertyAddress(
+            mSelector: CMIOObjectPropertySelector(kCMIOHardwarePropertyDevices),
+            mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+            mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+        )
+        var dataSize: UInt32 = 0
+        CMIOObjectGetPropertyDataSize(CMIOObjectID(kCMIOObjectSystemObject), &propertyAddress, 0, nil, &dataSize)
+        let count = Int(dataSize) / MemoryLayout<CMIOObjectID>.size
+        guard count > 0 else { return false }
+        var devices = [CMIOObjectID](repeating: 0, count: count)
+        CMIOObjectGetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &propertyAddress, 0, nil, dataSize, &dataSize, &devices)
+
+        for device in devices {
+            var isRunningAddress = CMIOObjectPropertyAddress(
+                mSelector: CMIOObjectPropertySelector(kCMIODevicePropertyDeviceIsRunningSomewhere),
+                mScope: CMIOObjectPropertyScope(kCMIOObjectPropertyScopeGlobal),
+                mElement: CMIOObjectPropertyElement(kCMIOObjectPropertyElementMain)
+            )
+            var isRunning: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            CMIOObjectGetPropertyData(device, &isRunningAddress, 0, nil, size, &size, &isRunning)
+            if isRunning != 0 { return true }
+        }
+        return false
+    }
+
+    static func isMicRunning() -> Bool {
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize)
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        guard count > 0 else { return false }
+        var devices = [AudioObjectID](repeating: 0, count: count)
+        AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &dataSize, &devices)
+
+        for device in devices {
+            var inputAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyStreams,
+                mScope: kAudioObjectPropertyScopeInput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var inputSize: UInt32 = 0
+            let result = AudioObjectGetPropertyDataSize(device, &inputAddress, 0, nil, &inputSize)
+            guard result == 0 && inputSize > 0 else { continue }
+
+            var isRunningAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            var isRunning: UInt32 = 0
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            AudioObjectGetPropertyData(device, &isRunningAddress, 0, nil, &size, &isRunning)
+            if isRunning != 0 { return true }
+        }
+        return false
     }
 
     func minutesUntilNextMeeting(from date: Date = Date()) -> Int? {
