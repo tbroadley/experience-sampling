@@ -647,11 +647,18 @@ struct ChatMessage: Identifiable {
     enum ChatRole { case assistant, user }
 }
 
+struct ScreenObservation {
+    let timestamp: Date
+    let context: String
+}
+
 final class FocusMonitor {
     private var timer: Timer?
     private var isShowingIntervention = false
     private var isChecking = false
     private var conversationHistory: [[String: Any]] = []
+    private var pastSessions: [[[String: Any]]] = []
+    private var screenHistory: [ScreenObservation] = []
 
     var checkInterval: TimeInterval { Double(UserDefaults.standard.integer(forKey: "focusCheckInterval").nonZeroOr(30)) }
     var isEnabled: Bool {
@@ -669,6 +676,8 @@ final class FocusMonitor {
         isShowingIntervention = false
         isChecking = false
         conversationHistory = []
+        pastSessions = []
+        screenHistory = []
         requestAccessibilityIfNeeded()
         startTimer()
     }
@@ -680,7 +689,66 @@ final class FocusMonitor {
 
     func resumeAfterIntervention() {
         isShowingIntervention = false
+        if !conversationHistory.isEmpty {
+            pastSessions.append(conversationHistory)
+        }
         conversationHistory = []
+    }
+
+    private func recordScreen(_ context: String) {
+        screenHistory.append(ScreenObservation(timestamp: Date(), context: context))
+    }
+
+    private func recentScreenSummary() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+
+        let start = screenHistory.startIndex
+        let recent = screenHistory[start...]
+
+        var runs: [(context: String, from: Date, to: Date)] = []
+        for obs in recent {
+            if let last = runs.last, last.context == obs.context {
+                runs[runs.count - 1] = (last.context, last.from, obs.timestamp)
+            } else {
+                runs.append((obs.context, obs.timestamp, obs.timestamp))
+            }
+        }
+
+        let lines = runs.suffix(15).map { run in
+            let duration = Int(run.to.timeIntervalSince(run.from))
+            let durStr = duration > 0 ? " (\(duration)s)" : ""
+            return "  \(formatter.string(from: run.from))\(durStr) — \(run.context)"
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func pastSessionsSummary() -> String {
+        guard !pastSessions.isEmpty else { return "" }
+        var parts: [String] = []
+        for (i, session) in pastSessions.enumerated() {
+            var lines: [String] = []
+            for msg in session {
+                let role = msg["role"] as? String ?? "?"
+                if role == "assistant" {
+                    let text: String
+                    if let content = msg["content"] as? [[String: Any]] {
+                        text = content.compactMap { $0["text"] as? String }.joined()
+                    } else if let content = msg["content"] as? String {
+                        text = content
+                    } else { continue }
+                    if !text.isEmpty { lines.append("  Coach: \(text)") }
+                } else if role == "user" {
+                    if let content = msg["content"] as? String {
+                        lines.append("  User: \(content)")
+                    }
+                }
+            }
+            if !lines.isEmpty {
+                parts.append("Session \(i + 1):\n\(lines.joined(separator: "\n"))")
+            }
+        }
+        return parts.joined(separator: "\n")
     }
 
     private var conversationTools: [[String: Any]] {
@@ -696,13 +764,23 @@ final class FocusMonitor {
     func sendMessage(userText: String, completion: @escaping (String) -> Void) {
         conversationHistory.append(["role": "user", "content": userText])
 
-        let systemPrompt = """
+        let screenSummary = recentScreenSummary()
+        let pastChats = pastSessionsSummary()
+
+        var systemPrompt = """
         You are a warm but direct focus coach. The user is in a pomodoro work session and got distracted. \
-        You've already pointed out they're off-task. Now they're explaining what's going on. \
-        Acknowledge their feelings briefly, then suggest a specific, concrete next step to get back to their task: "\(currentTask)". \
+        Their current task: "\(currentTask)". \
+        Acknowledge their feelings briefly, then suggest a specific, concrete next step to get back to their task. \
         Keep responses to 2-3 sentences. Be actionable, not preachy. \
         If the user says they're switching to a different task, use the update_pomodoro_goal tool to update their goal.
+
+        Recent screen activity this pomodoro:
+        \(screenSummary)
         """
+
+        if !pastChats.isEmpty {
+            systemPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
+        }
 
         callAPIWithTools(systemPrompt: systemPrompt, messages: conversationHistory, tools: conversationTools) { [weak self] response in
             guard let self, let response else { return }
@@ -790,22 +868,38 @@ final class FocusMonitor {
         let windowTitle = getWindowTitle(pid: frontApp.processIdentifier)
         let context = "\(appName)\(windowTitle.map { " — \($0)" } ?? "")"
 
+        recordScreen(context)
         isChecking = true
+
+        let screenSummary = recentScreenSummary()
+        let pastChats = pastSessionsSummary()
 
         let systemPrompt = """
         You are a strict focus coach. Respond with ONLY valid JSON, no other text.
         Format: {"on_task": true/false, "message": "string"}
         """
 
-        let userPrompt = """
+        var userPrompt = """
         The user is in a pomodoro. Their task: "\(currentTask)"
         They are currently in: \(context)
 
-        Is this on-task? Be strict — only on-task if clearly and directly related to the stated task.
+        Recent screen activity this pomodoro:
+        \(screenSummary)
+        """
+
+        if !pastChats.isEmpty {
+            userPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
+        }
+
+        userPrompt += """
+
+        \nIs this on-task? Be strict — only on-task if clearly and directly related to the stated task.
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
 
         If off-task, write a conversational opening message (1-2 sentences) that mentions their goal, \
-        notes what they're looking at, and asks what's going on. Be warm but direct.
+        notes what they're looking at, and asks what's going on. Be warm but direct. \
+        Use the screen history and past conversations for context — don't repeat yourself if you've already \
+        discussed the same distraction.
         If on-task, message can be empty.
         """
 
