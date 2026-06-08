@@ -1677,18 +1677,32 @@ struct PomodoroHistoryView: View {
 
 // MARK: - App Delegate
 
-/// Window delegate that runs a closure when the user closes the window via the
-/// native X button. `windowShouldClose` fires only for user-initiated closes,
-/// not programmatic `close()` calls, so this won't fire when we dismiss the
-/// window ourselves after a button action. Note: this app is LSUIElement with
-/// no standard menu bar, so Cmd+W is not routed to `performClose:` and does not
-/// close these windows — only the X button triggers this.
+/// Window delegate for prompt windows.
+///
+/// `onUserClose` runs from `windowShouldClose`, which fires only for
+/// user-initiated closes (the native X button), not programmatic `close()`
+/// calls — so it won't fire when we dismiss the window ourselves after a button
+/// action. Note: this app is LSUIElement with no standard menu bar, so Cmd+W is
+/// not routed to `performClose:` and does not close these windows — only the X
+/// button triggers this.
+///
+/// `onWillClose` runs from `windowWillClose`, which fires for *every* close
+/// including programmatic ones (e.g. when another prompt's `showWindow` replaces
+/// this window). It's a safety net for state that must be reset whenever the
+/// window goes away regardless of how it was dismissed.
 private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
-    let onUserClose: () -> Void
-    init(onUserClose: @escaping () -> Void) { self.onUserClose = onUserClose }
+    let onUserClose: (() -> Void)?
+    let onWillClose: (() -> Void)?
+    init(onUserClose: (() -> Void)? = nil, onWillClose: (() -> Void)? = nil) {
+        self.onUserClose = onUserClose
+        self.onWillClose = onWillClose
+    }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        onUserClose()
+        onUserClose?()
         return true
+    }
+    func windowWillClose(_ notification: Notification) {
+        onWillClose?()
     }
 }
 
@@ -1857,7 +1871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onUserClose: (() -> Void)? = nil) {
+    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onUserClose: (() -> Void)? = nil, onClose: (() -> Void)? = nil) {
         promptWindow?.close()
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
@@ -1869,8 +1883,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.center()
         window.level = .floating
         window.isReleasedWhenClosed = false
-        if let onUserClose {
-            let delegate = PromptWindowCloseDelegate(onUserClose: onUserClose)
+        if onUserClose != nil || onClose != nil {
+            let delegate = PromptWindowCloseDelegate(onUserClose: onUserClose, onWillClose: onClose)
             promptWindowDelegate = delegate
             window.delegate = delegate
         } else {
@@ -2035,7 +2049,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.focusMonitor.endorseCurrentContext()
             }
         )
-        showWindow(view, allowClose: false)
+        // Safety net: if this window is dismissed by any path other than its own
+        // buttons (e.g. another prompt's showWindow replaces it), reset the
+        // monitor so focus checks resume instead of stalling on a stuck
+        // isShowingIntervention flag. Idempotent with the button handlers.
+        showWindow(view, allowClose: false, onClose: { [weak self] in
+            self?.focusMonitor.resumeAfterIntervention()
+        })
     }
 
     @objc private func showIntradayPrompt() {
