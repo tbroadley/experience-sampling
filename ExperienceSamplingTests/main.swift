@@ -67,6 +67,54 @@ if !isolated {
 
 // MARK: - Tests
 
+// These run first: the data stores are singletons that load() on first access,
+// so the files must be seeded before anything else touches `.shared`. Guards the
+// documented gotcha — encoder/decoder date strategies must both be .iso8601, and
+// `try?` would silently swallow a mismatch into data loss.
+let esDir = (appSupport as NSString).appendingPathComponent("ExperienceSampling")
+try? FileManager.default.createDirectory(atPath: esDir, withIntermediateDirectories: true)
+let isoFmt = ISO8601DateFormatter()
+let seededDate = Date(timeIntervalSince1970: 1_700_000_000)  // whole seconds: round-trips exactly
+
+func seedFile(_ name: String, _ data: Data) {
+    try? data.write(to: URL(fileURLWithPath: (esDir as NSString).appendingPathComponent(name)))
+}
+func rawFile(_ name: String) -> String {
+    (try? String(contentsOf: URL(fileURLWithPath: (esDir as NSString).appendingPathComponent(name)), encoding: .utf8)) ?? ""
+}
+
+section("DataStore: ISO8601 dates round-trip through load/save (regression)")
+do {
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+    let seed = [Response(timestamp: seededDate, type: .startOfDay, excitement: 4)]
+    if let d = try? enc.encode(seed) { seedFile("responses.json", d) }
+
+    let loaded = DataStore.shared.fetchRecent()  // first access -> load()
+    checkEqual(loaded.count, 1, "load() decoded the seeded response")
+    check(loaded.first.map { Int($0.timestamp.timeIntervalSince1970) } == 1_700_000_000,
+          "decoded timestamp matches (decoder is .iso8601)")
+
+    DataStore.shared.add(Response(timestamp: Date(), type: .intraday, excitement: 3, activity: "x"))
+    check(rawFile("responses.json").contains(isoFmt.string(from: seededDate)),
+          "save() wrote an ISO8601 date string, not a number (encoder is .iso8601)")
+}
+
+section("PomodoroDataStore: ISO8601 dates round-trip through load/save (regression)")
+do {
+    let enc = JSONEncoder(); enc.dateEncodingStrategy = .iso8601
+    let seed = [PomodoroSession(startTime: seededDate, taskDescription: "seed", completed: true, pomodoroNumber: 1)]
+    if let d = try? enc.encode(seed) { seedFile("pomodoro-sessions.json", d) }
+
+    let loaded = PomodoroDataStore.shared.fetchRecent()  // first access -> load()
+    checkEqual(loaded.count, 1, "load() decoded the seeded session")
+    check(loaded.first.map { Int($0.startTime.timeIntervalSince1970) } == 1_700_000_000,
+          "decoded startTime matches (decoder is .iso8601)")
+
+    PomodoroDataStore.shared.add(PomodoroSession(startTime: Date(), taskDescription: "x", completed: false, pomodoroNumber: 2))
+    check(rawFile("pomodoro-sessions.json").contains(isoFmt.string(from: seededDate)),
+          "save() wrote an ISO8601 date string, not a number (encoder is .iso8601)")
+}
+
 section("restoreState: wall-clock remaining (commit 21cbb5f)")
 do {
     clearSaved()
