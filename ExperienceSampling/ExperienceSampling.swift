@@ -1639,9 +1639,23 @@ struct PomodoroHistoryView: View {
 
 // MARK: - App Delegate
 
+/// Window delegate that runs a closure when the user closes the window via the
+/// native X button or Cmd+W. `windowShouldClose` fires only for user-initiated
+/// closes, not programmatic `close()` calls, so this won't fire when we dismiss
+/// the window ourselves after a button action.
+private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
+    let onUserClose: () -> Void
+    init(onUserClose: @escaping () -> Void) { self.onUserClose = onUserClose }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        onUserClose()
+        return true
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var promptWindow: NSWindow?
+    private var promptWindowDelegate: PromptWindowCloseDelegate?
     private let scheduler = PromptScheduler()
     private let wakeDetector = WakeDetector()
     private let pomodoroScheduler = PomodoroScheduler()
@@ -1798,7 +1812,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func showWindow<V: View>(_ view: V, allowClose: Bool = true) {
+    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onUserClose: (() -> Void)? = nil) {
         promptWindow?.close()
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
@@ -1810,6 +1824,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.center()
         window.level = .floating
         window.isReleasedWhenClosed = false
+        if let onUserClose {
+            let delegate = PromptWindowCloseDelegate(onUserClose: onUserClose)
+            promptWindowDelegate = delegate
+            window.delegate = delegate
+        } else {
+            promptWindowDelegate = nil
+        }
         promptWindow = window
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -1894,7 +1915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.pomodoroScheduler.scheduleSnooze()
             }
         )
-        showWindow(view)
+        showWindow(view, onUserClose: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() })
     }
 
     private func showPomodoroBreak() {
@@ -1911,7 +1932,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             onStartBreak: { [weak self] in self?.pomodoroScheduler.startBreak(isLong: isLong) },
             onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleBreakSnooze() }
         )
-        showWindow(view)
+        showWindow(view, onUserClose: { [weak self] in self?.pomodoroScheduler.scheduleBreakSnooze() })
     }
 
     private func showPomodoroNext() {
@@ -1932,7 +1953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 },
                 onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() }
             )
-            self.showWindow(view)
+            self.showWindow(view, onUserClose: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() })
         }
     }
 
@@ -1975,6 +1996,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         intradaySnoozeTimer?.invalidate()
         var presented = true
+        let snooze: () -> Void = { [weak self] in
+            self?.intradaySnoozeTimer = Timer.scheduledTimer(withTimeInterval: self?.snoozeDuration ?? 1800, repeats: false) { _ in
+                self?.showIntradayPrompt()
+            }
+        }
         let view = IntradayView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
@@ -1982,13 +2008,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             onSubmit: { activity, excitement in
                 DataStore.shared.add(Response(timestamp: Date(), type: .intraday, excitement: excitement, activity: activity))
             },
-            onSnooze: { [weak self] in
-                self?.intradaySnoozeTimer = Timer.scheduledTimer(withTimeInterval: self?.snoozeDuration ?? 1800, repeats: false) { _ in
-                    self?.showIntradayPrompt()
-                }
-            }
+            onSnooze: snooze
         )
-        showWindow(view)
+        showWindow(view, onUserClose: snooze)
     }
 
     @objc private func showHistory() { showWindow(HistoryView()) }
