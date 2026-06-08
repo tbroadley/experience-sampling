@@ -1677,32 +1677,22 @@ struct PomodoroHistoryView: View {
 
 // MARK: - App Delegate
 
-/// Window delegate for prompt windows.
+/// Window delegate that runs `onClose` whenever the prompt window closes, for
+/// any reason. `windowWillClose` fires on *every* close — the user clicking the
+/// native X button, the SwiftUI view setting `isPresented = false`, and
+/// programmatic `close()` (e.g. when another prompt's `showWindow` replaces this
+/// window). So `onClose` is the single hook for snooze/cleanup that must run no
+/// matter how the window was dismissed; callers that only want to act on some
+/// closes (e.g. snooze unless the user committed an action) gate inside `onClose`.
 ///
-/// `onUserClose` runs from `windowShouldClose`, which fires only for
-/// user-initiated closes (the native X button), not programmatic `close()`
-/// calls — so it won't fire when we dismiss the window ourselves after a button
-/// action. Note: this app is LSUIElement with no standard menu bar, so Cmd+W is
-/// not routed to `performClose:` and does not close these windows — only the X
-/// button triggers this.
-///
-/// `onWillClose` runs from `windowWillClose`, which fires for *every* close
-/// including programmatic ones (e.g. when another prompt's `showWindow` replaces
-/// this window). It's a safety net for state that must be reset whenever the
-/// window goes away regardless of how it was dismissed.
+/// Note: this app is LSUIElement with no standard menu bar, so Cmd+W is not
+/// routed to `performClose:` and does not close these windows — only the X
+/// button and programmatic replacement do.
 private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
-    let onUserClose: (() -> Void)?
-    let onWillClose: (() -> Void)?
-    init(onUserClose: (() -> Void)? = nil, onWillClose: (() -> Void)? = nil) {
-        self.onUserClose = onUserClose
-        self.onWillClose = onWillClose
-    }
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        onUserClose?()
-        return true
-    }
+    let onClose: () -> Void
+    init(onClose: @escaping () -> Void) { self.onClose = onClose }
     func windowWillClose(_ notification: Notification) {
-        onWillClose?()
+        onClose()
     }
 }
 
@@ -1871,7 +1861,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onUserClose: (() -> Void)? = nil, onClose: (() -> Void)? = nil) {
+    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onClose: (() -> Void)? = nil) {
         promptWindow?.close()
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
@@ -1883,8 +1873,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.center()
         window.level = .floating
         window.isReleasedWhenClosed = false
-        if onUserClose != nil || onClose != nil {
-            let delegate = PromptWindowCloseDelegate(onUserClose: onUserClose, onWillClose: onClose)
+        if let onClose {
+            let delegate = PromptWindowCloseDelegate(onClose: onClose)
             promptWindowDelegate = delegate
             window.delegate = delegate
         } else {
@@ -1960,6 +1950,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let workMins = availableWorkMinutes()
         let defaultDuration = pomodoroScheduler.workDuration
         var presented = true
+        var committed = false
         let view = PomodoroTaskInputView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
@@ -1967,20 +1958,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             snoozeDuration: pomodoroScheduler.snoozeDuration,
             workMinutes: workMins < defaultDuration ? workMins : nil,
             onStart: { [weak self] task in
+                committed = true
                 self?.pomodoroScheduler.workDurationOverride = workMins
                 self?.pomodoroScheduler.startWork(task: task)
             },
             onSnooze: { [weak self] in
+                committed = true
                 self?.pomodoroScheduler.scheduleSnooze()
             }
         )
-        showWindow(view, onUserClose: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() })
+        // Snooze on any close that isn't an explicit Start/Snooze — covers the
+        // native X and programmatic replacement by another prompt's showWindow,
+        // so the prompt is never silently lost.
+        showWindow(view, onClose: { [weak self] in
+            if !committed { self?.pomodoroScheduler.scheduleSnooze() }
+        })
     }
 
     private func showPomodoroBreak() {
         let isLong = pomodoroScheduler.isLongBreakDue()
         let duration = isLong ? pomodoroScheduler.longBreakDuration : pomodoroScheduler.shortBreakDuration
         var presented = true
+        var committed = false
         let view = PomodoroBreakView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
@@ -1988,10 +1987,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isLongBreak: isLong,
             breakDuration: duration,
             snoozeDuration: pomodoroScheduler.breakSnoozeDuration,
-            onStartBreak: { [weak self] in self?.pomodoroScheduler.startBreak(isLong: isLong) },
-            onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleBreakSnooze() }
+            onStartBreak: { [weak self] in committed = true; self?.pomodoroScheduler.startBreak(isLong: isLong) },
+            onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleBreakSnooze() }
         )
-        showWindow(view, onUserClose: { [weak self] in self?.pomodoroScheduler.scheduleBreakSnooze() })
+        showWindow(view, onClose: { [weak self] in
+            if !committed { self?.pomodoroScheduler.scheduleBreakSnooze() }
+        })
     }
 
     private func showPomodoroNext() {
@@ -2000,6 +2001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let workMins = self.availableWorkMinutes()
             let defaultDuration = self.pomodoroScheduler.workDuration
             var presented = true
+            var committed = false
             let view = PomodoroNextView(
                 isPresented: Binding(get: { presented }, set: { [weak self] v in
                     presented = v; if !v { self?.promptWindow?.close() }
@@ -2007,12 +2009,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 snoozeDuration: self.pomodoroScheduler.snoozeDuration,
                 workMinutes: workMins < defaultDuration ? workMins : nil,
                 onStartNext: { [weak self] task in
+                    committed = true
                     self?.pomodoroScheduler.workDurationOverride = workMins
                     self?.pomodoroScheduler.startWork(task: task)
                 },
-                onSnooze: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() }
+                onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleSnooze() }
             )
-            self.showWindow(view, onUserClose: { [weak self] in self?.pomodoroScheduler.scheduleSnooze() })
+            self.showWindow(view, onClose: { [weak self] in
+                if !committed { self?.pomodoroScheduler.scheduleSnooze() }
+            })
         }
     }
 
@@ -2064,6 +2069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         intradaySnoozeTimer?.invalidate()
         var presented = true
+        var committed = false
         let snooze: () -> Void = { [weak self] in
             self?.intradaySnoozeTimer = Timer.scheduledTimer(withTimeInterval: self?.snoozeDuration ?? 1800, repeats: false) { _ in
                 self?.showIntradayPrompt()
@@ -2074,11 +2080,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 presented = v; if !v { self?.promptWindow?.close() }
             }),
             onSubmit: { activity, excitement in
+                committed = true
                 DataStore.shared.add(Response(timestamp: Date(), type: .intraday, excitement: excitement, activity: activity))
             },
-            onSnooze: snooze
+            onSnooze: { committed = true; snooze() }
         )
-        showWindow(view, onUserClose: snooze)
+        showWindow(view, onClose: { if !committed { snooze() } })
     }
 
     @objc private func showHistory() { showWindow(HistoryView()) }
