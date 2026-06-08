@@ -31,10 +31,11 @@ func section(_ name: String) { print("\n# \(name)") }
 
 let kPhase = "pomodoroPhase"
 let kStart = "pomodoroPhaseStart"
-let kDuration = "pommadoroPhaseDuration"  // sic: matches the (typo'd) constant in source
+let kDuration = "pomodoroPhaseDuration"
+let kLegacyDuration = "pommadoroPhaseDuration"  // old misspelling, migrated away
 let kTask = "pomodoroTask"
 let allPomodoroKeys = [
-    kPhase, kStart, kDuration, kTask, "pomodoroCount",
+    kPhase, kStart, kDuration, kLegacyDuration, kTask, "pomodoroCount",
     "pomodoroWorkDuration", "pomodoroShortBreak", "pomodoroLongBreak",
     "pomodoroSnooze", "pomodoroBreakSnooze",
 ]
@@ -107,6 +108,22 @@ do {
     let s = PomodoroScheduler()
     s.restoreState()
     checkEqual(s.phase, .idle, "phase idle with nothing saved")
+}
+
+section("legacy phase-duration key is migrated")
+do {
+    clearSaved()
+    let d = UserDefaults.standard
+    d.set("work", forKey: kPhase)
+    d.set(Date().addingTimeInterval(-100), forKey: kStart)
+    d.set(300, forKey: kLegacyDuration)  // only the old misspelled key is set
+    d.set("legacy", forKey: kTask)
+    let s = PomodoroScheduler()  // init() runs migrateLegacyKeys()
+    check(d.object(forKey: kLegacyDuration) == nil, "legacy key removed after migration")
+    checkEqual(d.integer(forKey: kDuration), 300, "duration moved to corrected key")
+    s.restoreState()
+    checkEqual(s.phase, .work, "in-progress session restored after migration")
+    check(abs(s.timeRemaining - 200) <= 2, "timeRemaining from migrated duration (got \(s.timeRemaining))")
 }
 
 section("break snooze pending state (cancel/schedule)")

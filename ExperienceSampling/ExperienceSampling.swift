@@ -287,7 +287,10 @@ final class PomodoroScheduler: ObservableObject {
 
     private let phaseKey = "pomodoroPhase"
     private let phaseStartKey = "pomodoroPhaseStart"
-    private let phaseDurationKey = "pommadoroPhaseDuration"
+    private let phaseDurationKey = "pomodoroPhaseDuration"
+    // Previous misspelling of phaseDurationKey, kept only for one-time migration
+    // of state saved by older builds (see migrateLegacyKeys).
+    private let legacyPhaseDurationKey = "pommadoroPhaseDuration"
     private let taskKey = "pomodoroTask"
     private let countKey = "pomodoroCount"
 
@@ -299,7 +302,20 @@ final class PomodoroScheduler: ObservableObject {
     var onWorkStart: ((String) -> Void)?
 
     init() {
+        migrateLegacyKeys()
         pomodoroCount = UserDefaults.standard.integer(forKey: countKey)
+    }
+
+    // Move any phase duration saved under the old misspelled key to the correct
+    // one so an in-progress session survives the upgrade, then drop the old key.
+    private func migrateLegacyKeys() {
+        let d = UserDefaults.standard
+        if d.object(forKey: legacyPhaseDurationKey) != nil {
+            if d.object(forKey: phaseDurationKey) == nil {
+                d.set(d.integer(forKey: legacyPhaseDurationKey), forKey: phaseDurationKey)
+            }
+            d.removeObject(forKey: legacyPhaseDurationKey)
+        }
     }
 
     func restoreState() {
