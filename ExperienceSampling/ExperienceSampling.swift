@@ -1918,22 +1918,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showPomodoroStartOfDay() {
+        var committed = false
         let view = CombinedStartOfDayView(
             snoozeDuration: pomodoroScheduler.snoozeDuration,
             onStartPomodoro: { [weak self] excitement in
+                committed = true
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.promptWindow?.close()
                 self?.showPomodoroTaskInput()
             },
             onSnooze: { [weak self] excitement in
+                committed = true
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.pomodoroScheduler.scheduleSnooze()
                 self?.promptWindow?.close()
             }
         )
-        showWindow(view, allowClose: false)
+        // If closed without an answer (e.g. another prompt's showWindow replaces
+        // it), don't lose the day's flow: schedule a snooze so the task-input
+        // prompt reappears. No response is recorded and the day stays un-marked,
+        // so the start-of-day prompt can still show again on the next wake.
+        showWindow(view, allowClose: false, onClose: { [weak self] in
+            if !committed { self?.pomodoroScheduler.scheduleSnooze() }
+        })
     }
 
     @objc private func showPomodoroTaskInput() {
