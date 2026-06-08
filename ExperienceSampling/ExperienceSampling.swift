@@ -775,6 +775,8 @@ final class FocusMonitor {
     private var conversationHistory: [[String: Any]] = []
     private var pastSessions: [[[String: Any]]] = []
     private var screenHistory: [ScreenObservation] = []
+    private var endorsedContexts: [String] = []
+    private var lastDetectedContext: String = ""
 
     var checkInterval: TimeInterval { Double(UserDefaults.standard.integer(forKey: "focusCheckInterval").nonZeroOr(30)) }
     var isEnabled: Bool {
@@ -794,6 +796,8 @@ final class FocusMonitor {
         conversationHistory = []
         pastSessions = []
         screenHistory = []
+        endorsedContexts = []
+        lastDetectedContext = ""
         requestAccessibilityIfNeeded()
         startTimer()
     }
@@ -808,6 +812,14 @@ final class FocusMonitor {
         if !conversationHistory.isEmpty {
             pastSessions.append(conversationHistory)
         }
+        conversationHistory = []
+    }
+
+    func endorseCurrentContext() {
+        if !lastDetectedContext.isEmpty {
+            endorsedContexts.append(lastDetectedContext)
+        }
+        isShowingIntervention = false
         conversationHistory = []
     }
 
@@ -898,6 +910,11 @@ final class FocusMonitor {
             systemPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
         }
 
+        if !endorsedContexts.isEmpty {
+            systemPrompt += "\n\nThe user has endorsed these screens as relevant to their task:\n"
+            systemPrompt += endorsedContexts.map { "  - \($0)" }.joined(separator: "\n")
+        }
+
         callAPIWithTools(systemPrompt: systemPrompt, messages: conversationHistory, tools: conversationTools) { [weak self] response in
             guard let self, let response else { return }
             self.conversationHistory.append(["role": "assistant", "content": response])
@@ -985,6 +1002,7 @@ final class FocusMonitor {
         let context = "\(appName)\(windowTitle.map { " — \($0)" } ?? "")"
 
         recordScreen(context)
+        lastDetectedContext = context
         isChecking = true
 
         let screenSummary = recentScreenSummary()
@@ -1007,10 +1025,16 @@ final class FocusMonitor {
             userPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
         }
 
+        if !endorsedContexts.isEmpty {
+            userPrompt += "\n\nThe user has explicitly endorsed these as relevant to their task:\n"
+            userPrompt += endorsedContexts.map { "  - \($0)" }.joined(separator: "\n")
+        }
+
         userPrompt += """
 
         \nIs this on-task? Be strict — only on-task if clearly and directly related to the stated task.
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
+        However, if the current screen matches something the user has endorsed as relevant, consider it on-task.
 
         If off-task, write a conversational opening message (1-2 sentences) that mentions their goal, \
         notes what they're looking at, and asks what's going on. Be warm but direct. \
@@ -1522,6 +1546,7 @@ struct FocusInterventionView: View {
     let currentTask: String
     var onSendMessage: (String, @escaping (String) -> Void) -> Void
     var onDismiss: () -> Void
+    var onEndorse: () -> Void
 
     @State private var messages: [ChatMessage] = []
     @State private var inputText: String = ""
@@ -1533,6 +1558,10 @@ struct FocusInterventionView: View {
             HStack {
                 Text("Focus Coach").font(.headline)
                 Spacer()
+                Button("This is relevant") {
+                    onEndorse()
+                    isPresented = false
+                }
                 Button("Back to work") {
                     onDismiss()
                     isPresented = false
@@ -1679,7 +1708,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
 
-        scheduler.onPromptTriggered = { [weak self] in self?.showIntradayPrompt() }
+        scheduler.onPromptTriggered = { [weak self] in
+            guard let self else { return }
+            let phase = self.pomodoroScheduler.phase
+            if phase == .shortBreak || phase == .longBreak { return }
+            self.showIntradayPrompt()
+        }
         scheduler.start()
 
         wakeDetector.onNewPomodoroDay = { [weak self] in
@@ -1994,6 +2028,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             },
             onDismiss: { [weak self] in
                 self?.focusMonitor.resumeAfterIntervention()
+            },
+            onEndorse: { [weak self] in
+                self?.focusMonitor.endorseCurrentContext()
             }
         )
         showWindow(view, allowClose: false)
