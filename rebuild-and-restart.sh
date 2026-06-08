@@ -23,7 +23,10 @@ if [[ -z "${CODESIGN_CERT:-}" ]]; then
 fi
 
 echo "==> Typechecking"
-swiftc -typecheck "$SRC_FILE"
+# -parse-as-library: the entry point is an @main struct (so the source can also
+# be compiled as a library into the test binary); without this flag swiftc treats
+# a lone file as a script and rejects @main.
+swiftc -parse-as-library -typecheck "$SRC_FILE"
 
 if command -v swiftlint >/dev/null 2>&1; then
   echo "==> Linting with swiftlint"
@@ -43,7 +46,7 @@ fi
 
 echo "==> Rebuilding binary into temporary bundle"
 mkdir -p "$(dirname "$TMP_BIN")"
-swiftc -O -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio "$SRC_FILE" -o "$TMP_BIN"
+swiftc -O -parse-as-library -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio "$SRC_FILE" -o "$TMP_BIN"
 
 echo "==> Codesigning temporary app bundle"
 codesign --force --sign "$CODESIGN_CERT" "$TMP_APP"

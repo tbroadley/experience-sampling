@@ -10,11 +10,27 @@ After making changes to the Swift code, use the rebuild script:
 
 `rebuild-and-restart.sh` handles typecheck, optional linting, rebuild, codesign, install, and app restart. The certificate name is configured in `.env`.
 
+## Tests
+
+```bash
+./run-tests.sh
+```
+
+Headless logic tests for `PomodoroScheduler` (wall-clock timer / restore, snooze
+state). The test file (`ExperienceSamplingTests/main.swift`) is compiled together
+with the app source under `-DTESTING`, which strips the app's `@main` entry point
+so the test file owns `main`. The binary is codesigned (Santa blocks unsigned
+binaries) and run with `CFFIXED_USER_HOME` pointed at a temp dir so the data
+stores never touch real data. Exit code is non-zero on any failure.
+
 ## Project Structure
 
 - Single-file Swift app: `ExperienceSampling/ExperienceSampling.swift`
+  - Entry point is an `@main struct` guarded by `#if !TESTING`; the app builds
+    with `-parse-as-library` so `@main` is valid in a lone file.
 - App bundle info: `ExperienceSampling/Info.plist`
 - Installed location: `/Applications/ExperienceSampling.app`
+- Tests: `ExperienceSamplingTests/main.swift`, run via `run-tests.sh`
 
 ## Data Storage
 

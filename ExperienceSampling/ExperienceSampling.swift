@@ -2124,8 +2124,21 @@ extension Double {
 
 // MARK: - Main
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+// An @main struct rather than bare top-level statements: when this file is
+// compiled into the headless test binary (with -DTESTING) alongside
+// ExperienceSamplingTests/main.swift, the parser rejects top-level expressions
+// in a non-main file even inside an inactive #if branch. A declaration is fine,
+// and stripping it under -DTESTING lets the test file own the entry point. The
+// normal app build (rebuild-and-restart.sh) compiles this file alone.
+#if !TESTING
+@main
+struct ExperienceSamplingApp {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}
+#endif
