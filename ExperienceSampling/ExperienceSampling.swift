@@ -1678,9 +1678,11 @@ struct PomodoroHistoryView: View {
 // MARK: - App Delegate
 
 /// Window delegate that runs a closure when the user closes the window via the
-/// native X button or Cmd+W. `windowShouldClose` fires only for user-initiated
-/// closes, not programmatic `close()` calls, so this won't fire when we dismiss
-/// the window ourselves after a button action.
+/// native X button. `windowShouldClose` fires only for user-initiated closes,
+/// not programmatic `close()` calls, so this won't fire when we dismiss the
+/// window ourselves after a button action. Note: this app is LSUIElement with
+/// no standard menu bar, so Cmd+W is not routed to `performClose:` and does not
+/// close these windows — only the X button triggers this.
 private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
     let onUserClose: () -> Void
     init(onUserClose: @escaping () -> Void) { self.onUserClose = onUserClose }
