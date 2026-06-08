@@ -282,6 +282,8 @@ final class PomodoroScheduler: ObservableObject {
     private var displayTimer: Timer?
     private var snoozeTimer: Timer?
     private var breakSnoozeTimer: Timer?
+    private var phaseStartDate: Date?
+    private var phaseDuration: Int = 0
 
     private let phaseKey = "pomodoroPhase"
     private let phaseStartKey = "pomodoroPhaseStart"
@@ -315,6 +317,8 @@ final class PomodoroScheduler: ObservableObject {
         if remaining > 0 {
             phase = savedPhase
             currentTask = UserDefaults.standard.string(forKey: taskKey) ?? ""
+            phaseStartDate = phaseStart
+            phaseDuration = duration
             timeRemaining = remaining
             startDisplayTimer()
             if savedPhase == .work { onWorkStart?(currentTask) }
@@ -331,8 +335,8 @@ final class PomodoroScheduler: ObservableObject {
 
     private func saveState() {
         UserDefaults.standard.set(phase.rawValue, forKey: phaseKey)
-        UserDefaults.standard.set(Date(), forKey: phaseStartKey)
-        UserDefaults.standard.set(timeRemaining, forKey: phaseDurationKey)
+        UserDefaults.standard.set(phaseStartDate ?? Date(), forKey: phaseStartKey)
+        UserDefaults.standard.set(phaseDuration, forKey: phaseDurationKey)
         UserDefaults.standard.set(currentTask, forKey: taskKey)
         UserDefaults.standard.set(pomodoroCount, forKey: countKey)
     }
@@ -354,7 +358,9 @@ final class PomodoroScheduler: ObservableObject {
         phase = .work
         let effectiveDuration = workDurationOverride ?? workDuration
         workDurationOverride = nil
-        timeRemaining = effectiveDuration * 60
+        phaseDuration = effectiveDuration * 60
+        timeRemaining = phaseDuration
+        phaseStartDate = Date()
 
         PomodoroDataStore.shared.add(PomodoroSession(
             startTime: Date(),
@@ -370,7 +376,9 @@ final class PomodoroScheduler: ObservableObject {
 
     func startBreak(isLong: Bool) {
         phase = isLong ? .longBreak : .shortBreak
-        timeRemaining = (isLong ? longBreakDuration : shortBreakDuration) * 60
+        phaseDuration = (isLong ? longBreakDuration : shortBreakDuration) * 60
+        timeRemaining = phaseDuration
+        phaseStartDate = Date()
         saveState()
         startDisplayTimer()
     }
@@ -412,8 +420,9 @@ final class PomodoroScheduler: ObservableObject {
         stopDisplayTimer()
         onTimerTick?(timeRemaining, phase)
         displayTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.timeRemaining -= 1
+            guard let self, let start = self.phaseStartDate else { return }
+            let elapsed = Int(Date().timeIntervalSince(start))
+            self.timeRemaining = max(self.phaseDuration - elapsed, 0)
             self.onTimerTick?(self.timeRemaining, self.phase)
 
             if self.timeRemaining <= 0 {
