@@ -242,6 +242,111 @@ do {
     check(!started, "onBreakStart not called for a restored work session")
 }
 
+// MARK: - BreakCaffeinator
+
+section("BreakCaffeinator.shouldCaffeinate truth table")
+do {
+    typealias C = BreakCaffeinator
+    check(!C.shouldCaffeinate(mode: .off, locked: false, capReached: false), "off + present -> no")
+    check(!C.shouldCaffeinate(mode: .off, locked: true, capReached: false), "off + away -> no")
+    check(!C.shouldCaffeinate(mode: .work, locked: false, capReached: false), "work + present -> no (machine won't idle-sleep)")
+    check(C.shouldCaffeinate(mode: .work, locked: true, capReached: false), "work + away -> yes")
+    check(C.shouldCaffeinate(mode: .onBreak, locked: false, capReached: false), "break + present -> yes")
+    check(C.shouldCaffeinate(mode: .onBreak, locked: true, capReached: false), "break + away -> yes")
+    check(C.shouldCaffeinate(mode: .awaitingReturn, locked: true, capReached: false), "awaitingReturn + away -> yes")
+    check(!C.shouldCaffeinate(mode: .awaitingReturn, locked: false, capReached: false), "awaitingReturn + present -> no")
+    check(!C.shouldCaffeinate(mode: .work, locked: true, capReached: true), "cap reached overrides work + away")
+    check(!C.shouldCaffeinate(mode: .onBreak, locked: true, capReached: true), "cap reached overrides break")
+}
+
+// Drives a caffeinator with a controllable lock state and records the latest
+// desired caffeination so the side effect (spawning `caffeinate`) never runs.
+func makeCaffeinator() -> (BreakCaffeinator, () -> Bool, (Bool) -> Void) {
+    var locked = false
+    var caffeinated = false
+    let c = BreakCaffeinator(
+        isScreenLocked: { locked },
+        onSetCaffeinated: { caffeinated = $0 }
+    )
+    return (c, { caffeinated }, { locked = $0 })
+}
+
+section("BreakCaffeinator: work caffeinates only while the screen is locked")
+do {
+    let (c, caffeinated, setLocked) = makeCaffeinator()
+    c.workStarted()
+    check(!caffeinated(), "work while present -> not caffeinating")
+    setLocked(true); c.screenDidLock()
+    check(caffeinated(), "work after locking (stepped away) -> caffeinating")
+    setLocked(false); c.screenDidUnlock()
+    check(!caffeinated(), "work after returning -> stops")
+}
+
+section("BreakCaffeinator: break caffeinates regardless of lock state")
+do {
+    let (c, caffeinated, _) = makeCaffeinator()
+    c.breakStarted()
+    check(caffeinated(), "break while present -> caffeinating")
+}
+
+section("BreakCaffeinator: break ending while away stays awake until return")
+do {
+    let (c, caffeinated, setLocked) = makeCaffeinator()
+    c.breakStarted()
+    setLocked(true); c.screenDidLock()
+    c.breakEnded()
+    checkEqual(c.mode, BreakCaffeinator.Mode.awaitingReturn, "break ended while locked -> awaitingReturn")
+    check(caffeinated(), "still caffeinating while user is away")
+    setLocked(false); c.screenDidUnlock()
+    checkEqual(c.mode, BreakCaffeinator.Mode.off, "returning -> off")
+    check(!caffeinated(), "stops once the user returns")
+}
+
+section("BreakCaffeinator: break ending while present stops immediately")
+do {
+    let (c, caffeinated, _) = makeCaffeinator()
+    c.breakStarted()
+    c.breakEnded()
+    checkEqual(c.mode, BreakCaffeinator.Mode.off, "break ended while present -> off")
+    check(!caffeinated(), "not caffeinating")
+}
+
+section("BreakCaffeinator: 1-hour away cap stops caffeination (end-of-day on break)")
+do {
+    let (c, caffeinated, setLocked) = makeCaffeinator()
+    c.breakStarted()
+    setLocked(true); c.screenDidLock()
+    c.breakEnded()
+    check(caffeinated(), "still awake right after locking on break")
+    c.handleAwayCapElapsed()
+    check(c.awayCapReached, "away cap marked reached")
+    check(!caffeinated(), "stops after 1 hour locked, so it won't run all night")
+}
+
+section("BreakCaffeinator: returning after the cap resets and re-arms")
+do {
+    let (c, caffeinated, setLocked) = makeCaffeinator()
+    c.workStarted()
+    setLocked(true); c.screenDidLock()
+    c.handleAwayCapElapsed()
+    check(!caffeinated(), "capped out during a locked work session")
+    setLocked(false); c.screenDidUnlock()
+    check(!c.awayCapReached, "unlocking clears the cap")
+    setLocked(true); c.screenDidLock()
+    check(caffeinated(), "stepping away again re-caffeinates")
+}
+
+section("BreakCaffeinator: sessionEnded stops caffeinating even while locked")
+do {
+    let (c, caffeinated, setLocked) = makeCaffeinator()
+    c.workStarted()
+    setLocked(true); c.screenDidLock()
+    check(caffeinated(), "caffeinating during away work session")
+    c.sessionEnded()
+    checkEqual(c.mode, BreakCaffeinator.Mode.off, "abandon -> off")
+    check(!caffeinated(), "abandoning stops caffeination")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")
