@@ -210,6 +210,38 @@ do {
     checkEqual(long.timeRemaining, 15 * 60, "long break = longBreakDuration(15) * 60")
 }
 
+section("onBreakStart fires when a break starts (drives caffeination)")
+do {
+    clearSaved()
+    let s = PomodoroScheduler()
+    var started = 0
+    s.onBreakStart = { started += 1 }
+    s.startBreak(isLong: false)
+    checkEqual(started, 1, "onBreakStart called once by startBreak")
+}
+
+section("onBreakStart fires when restoreState restores an in-progress break")
+do {
+    clearSaved()
+    setSavedState(phase: "shortBreak", startOffset: -100, duration: 300, task: "")
+    let s = PomodoroScheduler()
+    var started = false
+    s.onBreakStart = { started = true }
+    s.restoreState()
+    check(started, "onBreakStart called for a restored break (survives app restart)")
+}
+
+section("onBreakStart does not fire when restoreState restores work")
+do {
+    clearSaved()
+    setSavedState(phase: "work", startOffset: -100, duration: 300, task: "refactor")
+    let s = PomodoroScheduler()
+    var started = false
+    s.onBreakStart = { started = true }
+    s.restoreState()
+    check(!started, "onBreakStart not called for a restored work session")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")
