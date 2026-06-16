@@ -296,6 +296,7 @@ final class PomodoroScheduler: ObservableObject {
 
     var onTimerTick: ((Int, PomodoroPhase) -> Void)?
     var onWorkSessionEnd: (() -> Void)?
+    var onBreakStart: (() -> Void)?
     var onBreakEnd: (() -> Void)?
     var onSnoozeEnd: (() -> Void)?
     var onBreakSnoozeEnd: (() -> Void)?
@@ -337,7 +338,7 @@ final class PomodoroScheduler: ObservableObject {
             phaseDuration = duration
             timeRemaining = remaining
             startDisplayTimer()
-            if savedPhase == .work { onWorkStart?(currentTask) }
+            if savedPhase == .work { onWorkStart?(currentTask) } else { onBreakStart?() }
         } else {
             clearSavedState()
             if savedPhase == .work {
@@ -397,6 +398,7 @@ final class PomodoroScheduler: ObservableObject {
         phaseStartDate = Date()
         saveState()
         startDisplayTimer()
+        onBreakStart?()
     }
 
     func abandon() {
@@ -515,6 +517,73 @@ final class WakeDetector {
 
     func resetPomodoro() {
         UserDefaults.standard.removeObject(forKey: lastPomodoroPromptDateKey)
+    }
+}
+
+// MARK: - Break Caffeinator
+
+/// Keeps the Mac awake during breaks, mirroring the `caf` Alfred shortcut
+/// (`caffeinate -i`). Caffeination starts when a break starts and normally stops
+/// when the break ends — but if the break ends while the user is away (screen
+/// locked), it keeps the machine awake until they come back (screen unlock) so
+/// the next-pomodoro prompt isn't missed to a sleep.
+final class BreakCaffeinator {
+    private var process: Process?
+    // Break ended while the screen was locked; stop caffeinating on next unlock.
+    private var pendingStop = false
+
+    init() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleScreenUnlocked()
+        }
+    }
+
+    func breakStarted() {
+        pendingStop = false
+        startCaffeinate()
+    }
+
+    func breakEnded() {
+        guard process != nil else { return }
+        if isScreenLocked() {
+            pendingStop = true  // user is away; stay awake until they return
+        } else {
+            stopCaffeinate()
+        }
+    }
+
+    private func handleScreenUnlocked() {
+        guard pendingStop else { return }
+        stopCaffeinate()
+    }
+
+    private func startCaffeinate() {
+        guard process == nil else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        // -i: prevent idle system sleep (matches the Alfred shortcut).
+        // -w <pid>: self-terminate if this app dies, so we never orphan a
+        // caffeinate that keeps the Mac awake forever.
+        p.arguments = ["-i", "-w", "\(ProcessInfo.processInfo.processIdentifier)"]
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.process = nil }
+        }
+        do { try p.run(); process = p } catch { process = nil }
+    }
+
+    private func stopCaffeinate() {
+        pendingStop = false
+        process?.terminate()
+        process = nil
+    }
+
+    private func isScreenLocked() -> Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return (info["CGSSessionScreenIsLocked"] as? Int) == 1
     }
 }
 
@@ -1721,6 +1790,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let pomodoroScheduler = PomodoroScheduler()
     private let focusMonitor = FocusMonitor()
     private let calendarMonitor = CalendarMonitor()
+    private let caffeinator = BreakCaffeinator()
     private var abandonMenuItem: NSMenuItem?
     private var currentTaskMenuItem: NSMenuItem?
     private var takeBreakNowMenuItem: NSMenuItem?
@@ -1753,7 +1823,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.focusMonitor.stop()
             self?.showPomodoroBreak()
         }
-        pomodoroScheduler.onBreakEnd = { [weak self] in self?.showPomodoroNext() }
+        pomodoroScheduler.onBreakStart = { [weak self] in self?.caffeinator.breakStarted() }
+        pomodoroScheduler.onBreakEnd = { [weak self] in
+            self?.caffeinator.breakEnded()
+            self?.showPomodoroNext()
+        }
         pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInputDeferred() }
         pomodoroScheduler.onBreakSnoozeEnd = { [weak self] in self?.showPomodoroBreak() }
         pomodoroScheduler.onWorkStart = { [weak self] task in
@@ -1791,6 +1865,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                let task = taskItem.value, !task.isEmpty {
                 if pomodoroScheduler.phase != .idle {
                     pomodoroScheduler.abandon()
+                    caffeinator.breakEnded()
                 }
                 pomodoroScheduler.workDurationOverride = availableWorkMinutes()
                 pomodoroScheduler.startWork(task: task)
@@ -2059,6 +2134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func abandonPomodoro() {
         focusMonitor.stop()
         pomodoroScheduler.abandon()
+        caffeinator.breakEnded()
     }
 
     private func showFocusIntervention(appName: String, windowTitle: String, message: String) {
