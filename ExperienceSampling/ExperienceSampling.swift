@@ -522,43 +522,119 @@ final class WakeDetector {
 
 // MARK: - Break Caffeinator
 
-/// Keeps the Mac awake during breaks, mirroring the `caf` Alfred shortcut
-/// (`caffeinate -i`). Caffeination starts when a break starts and normally stops
-/// when the break ends — but if the break ends while the user is away (screen
-/// locked), it keeps the machine awake until they come back (screen unlock) so
-/// the next-pomodoro prompt isn't missed to a sleep.
+/// Keeps the Mac awake during pomodoros and breaks, mirroring the `caf` Alfred
+/// shortcut (`caffeinate -i`) — but never indefinitely.
+///
+/// - During a **work** session we only caffeinate while the screen is locked
+///   (the user stepped away). When they're present the machine won't idle-sleep
+///   on its own, so there's nothing to prevent.
+/// - During a **break** we caffeinate regardless of lock state, and if the break
+///   ends while the screen is locked we keep the machine awake until the user
+///   returns (unlock) so the next-pomodoro prompt isn't missed to a sleep.
+/// - In every case a **1-hour away cap** wins: once the screen has been locked
+///   continuously for `awayCap`, we stop caffeinating so a break (or work
+///   session) the user never returns from doesn't keep the Mac awake overnight.
+///   Unlocking resets the clock.
 final class BreakCaffeinator {
+    enum Mode: Equatable {
+        case off            // idle: do not caffeinate
+        case work           // work session: caffeinate only while locked
+        case onBreak        // break: caffeinate while away
+        case awaitingReturn // break ended while away: caffeinate until unlock
+    }
+
+    private(set) var mode: Mode = .off
+    private(set) var awayCapReached = false
     private var process: Process?
-    // Break ended while the screen was locked; stop caffeinating on next unlock.
-    private var pendingStop = false
+    private var awayTimer: Timer?
+    private let awayCap: TimeInterval
+    private let isScreenLocked: () -> Bool
+    // Test seam: when set, replaces spawning the real `caffeinate` process.
+    private let onSetCaffeinated: ((Bool) -> Void)?
 
-    init() {
-        DistributedNotificationCenter.default().addObserver(
-            forName: Notification.Name("com.apple.screenIsUnlocked"),
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handleScreenUnlocked()
-        }
+    init(awayCap: TimeInterval = 60 * 60,
+         isScreenLocked: @escaping () -> Bool = BreakCaffeinator.systemScreenLocked,
+         onSetCaffeinated: ((Bool) -> Void)? = nil) {
+        self.awayCap = awayCap
+        self.isScreenLocked = isScreenLocked
+        self.onSetCaffeinated = onSetCaffeinated
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"),
+                        object: nil, queue: .main) { [weak self] _ in self?.screenDidLock() }
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"),
+                        object: nil, queue: .main) { [weak self] _ in self?.screenDidUnlock() }
     }
 
-    func breakStarted() {
-        pendingStop = false
-        startCaffeinate()
-    }
+    // MARK: - Phase hooks (called from the app on pomodoro transitions)
+
+    func workStarted() { mode = .work; evaluate() }
+
+    func breakStarted() { mode = .onBreak; evaluate() }
 
     func breakEnded() {
-        guard process != nil else { return }
-        if isScreenLocked() {
-            pendingStop = true  // user is away; stay awake until they return
-        } else {
-            stopCaffeinate()
+        // If the user is away when the break ends, stay awake until they return
+        // (subject to the away cap); otherwise stop now.
+        mode = isScreenLocked() ? .awaitingReturn : .off
+        evaluate()
+    }
+
+    func sessionEnded() { mode = .off; evaluate() }
+
+    // MARK: - Decision
+
+    /// Pure decision: should `caffeinate` be running right now?
+    static func shouldCaffeinate(mode: Mode, locked: Bool, capReached: Bool) -> Bool {
+        if capReached { return false }
+        switch mode {
+        case .off: return false
+        case .onBreak: return true
+        case .work, .awaitingReturn: return locked
         }
     }
 
-    private func handleScreenUnlocked() {
-        guard pendingStop else { return }
-        stopCaffeinate()
+    /// Screen-event handlers. Exposed (non-private) so headless tests can drive
+    /// lock/unlock transitions with an injected lock state.
+    func screenDidLock() { evaluate() }
+
+    func screenDidUnlock() {
+        // The user is back: an "awaiting return" caffeination has done its job.
+        if mode == .awaitingReturn { mode = .off }
+        evaluate()
+    }
+
+    /// Invoked when the screen has been locked for `awayCap`. Exposed (non-private)
+    /// so headless tests can trigger it without waiting on the real timer.
+    func handleAwayCapElapsed() {
+        awayTimer = nil
+        awayCapReached = true
+        evaluate()
+    }
+
+    private func evaluate() {
+        let locked = isScreenLocked()
+        // The away clock is driven purely by lock state: arm it while locked,
+        // and reset it (and the cap) the moment the screen is unlocked.
+        if locked {
+            if awayTimer == nil && !awayCapReached {
+                awayTimer = Timer.scheduledTimer(withTimeInterval: awayCap, repeats: false) { [weak self] _ in
+                    self?.handleAwayCapElapsed()
+                }
+            }
+        } else {
+            awayTimer?.invalidate()
+            awayTimer = nil
+            awayCapReached = false
+        }
+
+        setCaffeinated(BreakCaffeinator.shouldCaffeinate(mode: mode, locked: locked, capReached: awayCapReached))
+    }
+
+    private func setCaffeinated(_ on: Bool) {
+        if let onSetCaffeinated {
+            onSetCaffeinated(on)
+            return
+        }
+        if on { startCaffeinate() } else { stopCaffeinate() }
     }
 
     private func startCaffeinate() {
@@ -576,12 +652,11 @@ final class BreakCaffeinator {
     }
 
     private func stopCaffeinate() {
-        pendingStop = false
         process?.terminate()
         process = nil
     }
 
-    private func isScreenLocked() -> Bool {
+    static func systemScreenLocked() -> Bool {
         guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
         return (info["CGSSessionScreenIsLocked"] as? Int) == 1
     }
@@ -1832,6 +1907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pomodoroScheduler.onBreakSnoozeEnd = { [weak self] in self?.showPomodoroBreak() }
         pomodoroScheduler.onWorkStart = { [weak self] task in
             self?.focusMonitor.start(task: task)
+            self?.caffeinator.workStarted()
         }
 
         focusMonitor.onOffTaskDetected = { [weak self] appName, windowTitle, message in
@@ -1865,7 +1941,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                let task = taskItem.value, !task.isEmpty {
                 if pomodoroScheduler.phase != .idle {
                     pomodoroScheduler.abandon()
-                    caffeinator.breakEnded()
+                    caffeinator.sessionEnded()
                 }
                 pomodoroScheduler.workDurationOverride = availableWorkMinutes()
                 pomodoroScheduler.startWork(task: task)
@@ -2134,7 +2210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func abandonPomodoro() {
         focusMonitor.stop()
         pomodoroScheduler.abandon()
-        caffeinator.breakEnded()
+        caffeinator.sessionEnded()
     }
 
     private func showFocusIntervention(appName: String, windowTitle: String, message: String) {
