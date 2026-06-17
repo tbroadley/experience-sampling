@@ -123,7 +123,6 @@ do {
     s.restoreState()
     checkEqual(s.phase, .work, "restores work phase")
     check(abs(s.timeRemaining - 200) <= 2, "timeRemaining ≈ duration - elapsed (got \(s.timeRemaining), want ~200)")
-    checkEqual(s.currentTask, "refactor", "restores task")
 }
 
 section("restoreState: expired work session ends instead of restoring")
@@ -189,10 +188,9 @@ section("startWork sets wall-clock fields (defaults)")
 do {
     clearSaved()
     let s = PomodoroScheduler()
-    s.startWork(task: "build")
+    s.startWork()
     checkEqual(s.phase, .work, "phase is work")
     checkEqual(s.timeRemaining, 25 * 60, "timeRemaining = workDuration(25) * 60")
-    checkEqual(s.currentTask, "build", "currentTask set")
 }
 
 section("startBreak sets duration by length")

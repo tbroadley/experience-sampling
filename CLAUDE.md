@@ -36,7 +36,22 @@ stores never touch real data. Exit code is non-zero on any failure.
 
 Data is stored in `~/Library/Application Support/ExperienceSampling/`:
 - `responses.json` - Experience sampling responses
-- `pomodoro-sessions.json` - Pomodoro session history
+- `pomodoro-sessions.json` - Pomodoro session history (`taskDescription` is now
+  always empty — the per-pomodoro goal feature was removed)
+- `anthropic-api-key.txt` - Claude API key for the focus coach
+- `todoist-api-token.txt` - Todoist API token (set in Settings → Focus)
+- `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
+
+## Focus Coach & Todoist
+
+The focus coach no longer uses a manually-set pomodoro goal. Instead, on every
+focus check it fetches the user's **top Todoist to-do for today** (lowest
+`day_order` among incomplete tasks due on or before today — overdue included) via
+the Todoist Sync API (`POST /api/v1/sync`, `resource_types=["items"]`) and keeps
+the user on that. This is the same `day_order` field the `tbroadley/status-dashboard`
+app persists when you reorder todos, so the two stay in sync through Todoist itself
+(no direct coupling). When there is no to-do for today, the coach prompts the user
+to create one and can add it via the `create_todo` tool (`POST /api/v1/tasks`).
 
 ## Gotchas
 

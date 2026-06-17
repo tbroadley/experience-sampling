@@ -270,7 +270,6 @@ final class PromptScheduler: ObservableObject {
 final class PomodoroScheduler: ObservableObject {
     @Published var phase: PomodoroPhase = .idle
     @Published var timeRemaining: Int = 0
-    @Published var currentTask: String = ""
     @Published var pomodoroCount: Int = 0  // cycles 1-4
 
     var workDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroWorkDuration").nonZeroOr(25) }
@@ -291,6 +290,7 @@ final class PomodoroScheduler: ObservableObject {
     // Previous misspelling of phaseDurationKey, kept only for one-time migration
     // of state saved by older builds (see migrateLegacyKeys).
     private let legacyPhaseDurationKey = "pommadoroPhaseDuration"
+    // No longer written; still cleared so stale state from older builds goes away.
     private let taskKey = "pomodoroTask"
     private let countKey = "pomodoroCount"
 
@@ -300,7 +300,7 @@ final class PomodoroScheduler: ObservableObject {
     var onBreakEnd: (() -> Void)?
     var onSnoozeEnd: (() -> Void)?
     var onBreakSnoozeEnd: (() -> Void)?
-    var onWorkStart: ((String) -> Void)?
+    var onWorkStart: (() -> Void)?
 
     init() {
         migrateLegacyKeys()
@@ -333,12 +333,11 @@ final class PomodoroScheduler: ObservableObject {
 
         if remaining > 0 {
             phase = savedPhase
-            currentTask = UserDefaults.standard.string(forKey: taskKey) ?? ""
             phaseStartDate = phaseStart
             phaseDuration = duration
             timeRemaining = remaining
             startDisplayTimer()
-            if savedPhase == .work { onWorkStart?(currentTask) } else { onBreakStart?() }
+            if savedPhase == .work { onWorkStart?() } else { onBreakStart?() }
         } else {
             clearSavedState()
             if savedPhase == .work {
@@ -354,7 +353,6 @@ final class PomodoroScheduler: ObservableObject {
         UserDefaults.standard.set(phase.rawValue, forKey: phaseKey)
         UserDefaults.standard.set(phaseStartDate ?? Date(), forKey: phaseStartKey)
         UserDefaults.standard.set(phaseDuration, forKey: phaseDurationKey)
-        UserDefaults.standard.set(currentTask, forKey: taskKey)
         UserDefaults.standard.set(pomodoroCount, forKey: countKey)
     }
 
@@ -367,10 +365,9 @@ final class PomodoroScheduler: ObservableObject {
 
     var workDurationOverride: Int?
 
-    func startWork(task: String) {
+    func startWork() {
         snoozeTimer?.invalidate()
         snoozeTimer = nil
-        currentTask = task
         pomodoroCount = (pomodoroCount % 4) + 1
         phase = .work
         let effectiveDuration = workDurationOverride ?? workDuration
@@ -379,16 +376,18 @@ final class PomodoroScheduler: ObservableObject {
         timeRemaining = phaseDuration
         phaseStartDate = Date()
 
+        // The per-pomodoro goal is gone; the focus coach now tracks the top
+        // Todoist to-do live, so sessions are recorded without a fixed task.
         PomodoroDataStore.shared.add(PomodoroSession(
             startTime: Date(),
-            taskDescription: task,
+            taskDescription: "",
             completed: false,
             pomodoroNumber: pomodoroCount
         ))
 
         saveState()
         startDisplayTimer()
-        onWorkStart?(task)
+        onWorkStart?()
     }
 
     func startBreak(isLong: Bool) {
@@ -928,6 +927,99 @@ struct ScreenObservation {
     let context: String
 }
 
+// MARK: - Todoist
+
+struct TodoistTask {
+    let id: String
+    let content: String
+    let dayOrder: Int
+}
+
+enum TopTodo {
+    case todo(TodoistTask)
+    case none         // token works, but no qualifying to-do for today
+    case unavailable  // no token, or the fetch failed — don't nag about it
+}
+
+// Reads today's top to-do from Todoist, the same source status-dashboard writes
+// its ordering to: reordering there persists to the `day_order` field via the
+// Sync API, so the lowest day_order among today's incomplete tasks is "the top".
+enum TodoistClient {
+    static var tokenFileURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("ExperienceSampling/todoist-api-token.txt")
+    }
+
+    static func readToken() -> String? {
+        guard let token = try? String(contentsOf: tokenFileURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
+        return token
+    }
+
+    // Mirrors status-dashboard's get_tasks_for_date(today): incomplete, not
+    // deleted, with a due date on or before today (overdue included), ordered by
+    // day_order ascending.
+    static func fetchTopTodo(completion: @escaping (TopTodo) -> Void) {
+        guard let token = readToken() else { completion(.unavailable); return }
+
+        var request = URLRequest(url: URL(string: "https://api.todoist.com/api/v1/sync")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        // resource_types=["items"], percent-encoded.
+        request.httpBody = "sync_token=*&resource_types=%5B%22items%22%5D".data(using: .utf8)
+        request.timeoutInterval = 15
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data, error == nil,
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let items = json["items"] as? [[String: Any]] else {
+                completion(.unavailable)
+                return
+            }
+
+            let today = todayString()
+            let candidates: [TodoistTask] = items.compactMap { item in
+                if (item["checked"] as? Bool ?? false) || (item["is_deleted"] as? Bool ?? false) { return nil }
+                guard let due = item["due"] as? [String: Any],
+                      let dueRaw = due["date"] as? String, !dueRaw.isEmpty else { return nil }
+                guard String(dueRaw.prefix(10)) <= today else { return nil }
+                guard let id = item["id"] as? String, let content = item["content"] as? String else { return nil }
+                return TodoistTask(id: id, content: content, dayOrder: item["day_order"] as? Int ?? 0)
+            }
+
+            guard let top = candidates.min(by: { $0.dayOrder < $1.dayOrder }) else {
+                completion(.none)
+                return
+            }
+            completion(.todo(top))
+        }.resume()
+    }
+
+    static func createTask(content: String, completion: @escaping (Bool) -> Void) {
+        guard let token = readToken() else { completion(false); return }
+        var request = URLRequest(url: URL(string: "https://api.todoist.com/api/v1/tasks")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["content": content, "due_string": "today"])
+        request.timeoutInterval = 10
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            let ok = error == nil && ((response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false)
+            completion(ok)
+        }.resume()
+    }
+
+    private static func todayString() -> String {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date())
+    }
+}
+
 final class FocusMonitor {
     private var timer: Timer?
     private var isShowingIntervention = false
@@ -937,6 +1029,10 @@ final class FocusMonitor {
     private var screenHistory: [ScreenObservation] = []
     private var endorsedContexts: [String] = []
     private var lastDetectedContext: String = ""
+    private var lastNoTodoPrompt: Date?
+
+    enum Mode { case offTask, noTodo }
+    private var mode: Mode = .offTask
 
     var checkInterval: TimeInterval { Double(UserDefaults.standard.integer(forKey: "focusCheckInterval").nonZeroOr(30)) }
     var isEnabled: Bool {
@@ -944,13 +1040,15 @@ final class FocusMonitor {
         return (val as? Bool) ?? true
     }
 
-    var currentTask: String = ""
-    var onOffTaskDetected: ((String, String, String) -> Void)?
-    var onUpdateTask: ((String) -> Void)?
+    // The current top Todoist to-do, re-fetched on every check.
+    private var currentTopTodo: String = ""
+    var onOffTaskDetected: ((String) -> Void)?
+    var onTopTodoChanged: ((String?) -> Void)?
 
-    func start(task: String) {
+    func start() {
         guard isEnabled else { return }
-        currentTask = task
+        currentTopTodo = ""
+        mode = .offTask
         isShowingIntervention = false
         isChecking = false
         conversationHistory = []
@@ -958,6 +1056,7 @@ final class FocusMonitor {
         screenHistory = []
         endorsedContexts = []
         lastDetectedContext = ""
+        lastNoTodoPrompt = nil
         requestAccessibilityIfNeeded()
         startTimer()
     }
@@ -1040,12 +1139,12 @@ final class FocusMonitor {
     }
 
     private var conversationTools: [[String: Any]] {
-        [["name": "update_pomodoro_goal",
-          "description": "Update the user's current pomodoro goal/task description. Use this when the user indicates they're moving on to a different task or want to reframe what they're working on.",
+        [["name": "create_todo",
+          "description": "Add a new to-do to the user's Todoist list for today. Use this when the user tells you what they want to work on so it becomes part of their list.",
           "input_schema": [
             "type": "object",
-            "properties": ["new_goal": ["type": "string", "description": "The new goal/task description"]],
-            "required": ["new_goal"]
+            "properties": ["content": ["type": "string", "description": "The to-do text"]],
+            "required": ["content"]
           ]]]
     }
 
@@ -1055,16 +1154,28 @@ final class FocusMonitor {
         let screenSummary = recentScreenSummary()
         let pastChats = pastSessionsSummary()
 
-        var systemPrompt = """
-        You are a warm but direct focus coach. The user is in a pomodoro work session and got distracted. \
-        Their current task: "\(currentTask)". \
-        Acknowledge their feelings briefly, then suggest a specific, concrete next step to get back to their task. \
-        Keep responses to 2-3 sentences. Be actionable, not preachy. \
-        If the user says they're switching to a different task, use the update_pomodoro_goal tool to update their goal.
+        var systemPrompt: String
+        if mode == .noTodo {
+            systemPrompt = """
+            You are a warm but direct focus coach. The user is in a pomodoro work session but has no to-do \
+            set for today. Help them decide the single most important thing to work on right now, then use the \
+            create_todo tool to add it to today's list. Keep responses to 2-3 sentences. Be actionable, not preachy.
 
-        Recent screen activity this pomodoro:
-        \(screenSummary)
-        """
+            Recent screen activity this pomodoro:
+            \(screenSummary)
+            """
+        } else {
+            systemPrompt = """
+            You are a warm but direct focus coach. The user is in a pomodoro work session and got distracted. \
+            Their current top to-do: "\(currentTopTodo)". \
+            Acknowledge their feelings briefly, then suggest a specific, concrete next step to get back to their top to-do. \
+            Keep responses to 2-3 sentences. Be actionable, not preachy. \
+            If the user says they want to work on something different, use the create_todo tool to add it to their list for today.
+
+            Recent screen activity this pomodoro:
+            \(screenSummary)
+            """
+        }
 
         if !pastChats.isEmpty {
             systemPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
@@ -1116,21 +1227,25 @@ final class FocusMonitor {
                 let toolId = toolBlock["id"] as? String ?? ""
                 let input = toolBlock["input"] as? [String: Any] ?? [:]
 
-                var toolResult = "done"
-                if toolName == "update_pomodoro_goal", let newGoal = input["new_goal"] as? String {
-                    self.currentTask = newGoal
-                    DispatchQueue.main.async { self.onUpdateTask?(newGoal) }
-                    toolResult = "Goal updated to: \(newGoal)"
+                // Feed the tool result back and continue the conversation loop.
+                let continueWith: (String) -> Void = { [weak self] toolResult in
+                    guard let self else { return }
+                    var updatedMessages = messages
+                    updatedMessages.append(["role": "assistant", "content": content])
+                    updatedMessages.append(["role": "user", "content": [
+                        ["type": "tool_result", "tool_use_id": toolId, "content": toolResult]
+                    ]])
+                    self.conversationHistory = updatedMessages
+                    self.callAPIWithTools(systemPrompt: systemPrompt, messages: updatedMessages, tools: tools, completion: completion)
                 }
 
-                var updatedMessages = messages
-                updatedMessages.append(["role": "assistant", "content": content])
-                updatedMessages.append(["role": "user", "content": [
-                    ["type": "tool_result", "tool_use_id": toolId, "content": toolResult]
-                ]])
-
-                self.conversationHistory = updatedMessages
-                self.callAPIWithTools(systemPrompt: systemPrompt, messages: updatedMessages, tools: tools, completion: completion)
+                if toolName == "create_todo", let todo = input["content"] as? String {
+                    TodoistClient.createTask(content: todo) { ok in
+                        continueWith(ok ? "Added \"\(todo)\" to today's list." : "Failed to add the to-do — tell the user to add it manually.")
+                    }
+                } else {
+                    continueWith("done")
+                }
             } else {
                 completion(content)
             }
@@ -1165,6 +1280,26 @@ final class FocusMonitor {
         lastDetectedContext = context
         isChecking = true
 
+        TodoistClient.fetchTopTodo { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .unavailable:
+                // No token or the fetch failed — skip this check silently.
+                self.isChecking = false
+            case .none:
+                self.isChecking = false
+                self.currentTopTodo = ""
+                DispatchQueue.main.async { self.onTopTodoChanged?(nil) }
+                self.maybePromptCreateTodo()
+            case .todo(let todo):
+                self.currentTopTodo = todo.content
+                DispatchQueue.main.async { self.onTopTodoChanged?(todo.content) }
+                self.classify(context: context)
+            }
+        }
+    }
+
+    private func classify(context: String) {
         let screenSummary = recentScreenSummary()
         let pastChats = pastSessionsSummary()
 
@@ -1174,7 +1309,7 @@ final class FocusMonitor {
         """
 
         var userPrompt = """
-        The user is in a pomodoro. Their task: "\(currentTask)"
+        The user is in a pomodoro. Their top to-do: "\(currentTopTodo)"
         They are currently in: \(context)
 
         Recent screen activity this pomodoro:
@@ -1186,17 +1321,17 @@ final class FocusMonitor {
         }
 
         if !endorsedContexts.isEmpty {
-            userPrompt += "\n\nThe user has explicitly endorsed these as relevant to their task:\n"
+            userPrompt += "\n\nThe user has explicitly endorsed these as relevant to their to-do:\n"
             userPrompt += endorsedContexts.map { "  - \($0)" }.joined(separator: "\n")
         }
 
         userPrompt += """
 
-        \nIs this on-task? Be strict — only on-task if clearly and directly related to the stated task.
+        \nIs this on-task? Be strict — only on-task if clearly and directly related to the stated to-do.
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
         However, if the current screen matches something the user has endorsed as relevant, consider it on-task.
 
-        If off-task, write a conversational opening message (1-2 sentences) that mentions their goal, \
+        If off-task, write a conversational opening message (1-2 sentences) that mentions their top to-do, \
         notes what they're looking at, and asks what's going on. Be warm but direct. \
         Use the screen history and past conversations for context — don't repeat yourself if you've already \
         discussed the same distraction.
@@ -1222,13 +1357,28 @@ final class FocusMonitor {
             self.logCheck(context: context, onTask: onTask, message: message)
 
             guard !onTask else { return }
+            self.mode = .offTask
             self.isShowingIntervention = true
             self.conversationHistory = [["role": "assistant", "content": message]]
 
             DispatchQueue.main.async {
-                self.onOffTaskDetected?(appName, windowTitle ?? "", message)
+                self.onOffTaskDetected?(message)
             }
         }
+    }
+
+    // When there's no to-do for today, nudge the user to create one — but no more
+    // than once every 5 minutes so it doesn't nag on every check.
+    private func maybePromptCreateTodo() {
+        guard !isShowingIntervention else { return }
+        if let last = lastNoTodoPrompt, Date().timeIntervalSince(last) < 300 { return }
+        lastNoTodoPrompt = Date()
+        mode = .noTodo
+        isShowingIntervention = true
+        let message = "You don't have a to-do set for today yet. What's the most important thing you want to get done right now? Tell me and I'll add it to your list."
+        conversationHistory = [["role": "assistant", "content": message]]
+        logCheck(context: lastDetectedContext, onTask: false, message: message)
+        DispatchQueue.main.async { self.onOffTaskDetected?(message) }
     }
 
     private func getWindowTitle(pid: pid_t) -> String? {
@@ -1282,7 +1432,7 @@ final class FocusMonitor {
         let formatter = ISO8601DateFormatter()
         let entry: [String: Any] = [
             "timestamp": formatter.string(from: Date()),
-            "task": currentTask,
+            "task": currentTopTodo,
             "context": context,
             "on_task": onTask,
             "message": message
@@ -1449,6 +1599,8 @@ struct SettingsView: View {
     @State private var selectedTab = 0
     @State private var apiKey: String = ""
     @State private var apiKeySaved = false
+    @State private var todoistToken: String = ""
+    @State private var todoistTokenSaved = false
 
     private var apiKeyFileURL: URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -1489,13 +1641,20 @@ struct SettingsView: View {
                 }
                 Text(apiKeySaved ? "Key saved" : (apiKey.isEmpty ? "No API key set" : "Press Save to apply"))
                     .font(.caption).foregroundColor(apiKeySaved ? .green : .secondary)
+                HStack {
+                    SecureField("Todoist API Token", text: $todoistToken)
+                        .onSubmit { saveTodoistToken() }
+                    Button("Save") { saveTodoistToken() }
+                }
+                Text(todoistTokenSaved ? "Token saved" : (todoistToken.isEmpty ? "No Todoist token set" : "Press Save to apply"))
+                    .font(.caption).foregroundColor(todoistTokenSaved ? .green : .secondary)
             }
             .tabItem { Label("Focus", systemImage: "eye") }
             .tag(2)
         }
         .padding()
-        .frame(width: 320, height: 220)
-        .onAppear { loadAPIKey() }
+        .frame(width: 320, height: 280)
+        .onAppear { loadAPIKey(); loadTodoistToken() }
     }
 
     private func loadAPIKey() {
@@ -1506,6 +1665,16 @@ struct SettingsView: View {
     private func saveAPIKey() {
         try? apiKey.trimmingCharacters(in: .whitespacesAndNewlines).write(to: apiKeyFileURL, atomically: true, encoding: .utf8)
         apiKeySaved = true
+    }
+
+    private func loadTodoistToken() {
+        todoistToken = (try? String(contentsOf: TodoistClient.tokenFileURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
+        todoistTokenSaved = !todoistToken.isEmpty
+    }
+
+    private func saveTodoistToken() {
+        try? todoistToken.trimmingCharacters(in: .whitespacesAndNewlines).write(to: TodoistClient.tokenFileURL, atomically: true, encoding: .utf8)
+        todoistTokenSaved = true
     }
 }
 
@@ -1556,21 +1725,17 @@ struct CombinedStartOfDayView: View {
 }
 
 enum TaskInputFocus: Hashable {
-    case textField
     case snooze
     case start
 }
 
 struct PomodoroTaskInputView: View {
     @Binding var isPresented: Bool
-    @State private var task: String = ""
     @FocusState private var focus: TaskInputFocus?
     var snoozeDuration: Int
     var workMinutes: Int?
-    var onStart: (String) -> Void
+    var onStart: () -> Void
     var onSnooze: () -> Void
-
-    private var isValid: Bool { !task.trimmingCharacters(in: .whitespaces).isEmpty }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -1579,31 +1744,23 @@ struct PomodoroTaskInputView: View {
                 Text("\(mins) min (meeting coming up)")
                     .font(.caption).foregroundColor(.orange)
             }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("What will you work on?")
-                TextField("Task description", text: $task)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focus, equals: .textField)
-                    .onSubmit { if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
-            }
+            Text("The focus coach will keep you on your top to-do.")
+                .font(.caption).foregroundColor(.secondary)
             HStack(spacing: 12) {
                 Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
                     .focused($focus, equals: .snooze)
-                Button("Start") {
-                    if isValid { onStart(task.trimmingCharacters(in: .whitespaces)); isPresented = false }
-                }
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(!isValid)
-                .buttonStyle(.borderedProminent)
-                .focused($focus, equals: .start)
+                Button("Start") { onStart(); isPresented = false }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .buttonStyle(.borderedProminent)
+                    .focused($focus, equals: .start)
             }
         }
         .padding(24)
         .frame(width: 320)
         .onAppear {
             NSApp.activate(ignoringOtherApps: true)
-            focus = .textField
+            focus = .start
         }
     }
 }
@@ -1647,21 +1804,17 @@ struct PomodoroBreakView: View {
 }
 
 enum NextFocus: Hashable {
-    case task
     case snooze
     case startNext
 }
 
 struct PomodoroNextView: View {
     @Binding var isPresented: Bool
-    @State private var task: String = ""
     @FocusState private var focus: NextFocus?
     var snoozeDuration: Int
     var workMinutes: Int?
-    var onStartNext: (String) -> Void
+    var onStartNext: () -> Void
     var onSnooze: () -> Void
-
-    private var isValid: Bool { !task.trimmingCharacters(in: .whitespaces).isEmpty }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -1671,31 +1824,21 @@ struct PomodoroNextView: View {
                 Text("\(mins) min (meeting coming up)")
                     .font(.caption).foregroundColor(.orange)
             }
-            VStack(alignment: .leading, spacing: 8) {
-                Text("What will you work on?")
-                TextField("Task description", text: $task)
-                    .textFieldStyle(.roundedBorder)
-                    .focused($focus, equals: .task)
-                    .onSubmit { if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false } }
-            }
             HStack(spacing: 12) {
                 Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
                     .keyboardShortcut(.escape, modifiers: [])
                     .focused($focus, equals: .snooze)
-                Button("Start Pomodoro") {
-                    if isValid { onStartNext(task.trimmingCharacters(in: .whitespaces)); isPresented = false }
-                }
-                .keyboardShortcut(.return, modifiers: [])
-                .disabled(!isValid)
-                .buttonStyle(.borderedProminent)
-                .focused($focus, equals: .startNext)
+                Button("Start Pomodoro") { onStartNext(); isPresented = false }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .buttonStyle(.borderedProminent)
+                    .focused($focus, equals: .startNext)
             }
         }
         .padding(24)
         .frame(width: 320)
         .onAppear {
             NSApp.activate(ignoringOtherApps: true)
-            focus = .task
+            focus = .startNext
         }
     }
 }
@@ -1703,7 +1846,6 @@ struct PomodoroNextView: View {
 struct FocusInterventionView: View {
     @Binding var isPresented: Bool
     let initialMessage: String
-    let currentTask: String
     var onSendMessage: (String, @escaping (String) -> Void) -> Void
     var onDismiss: () -> Void
     var onEndorse: () -> Void
@@ -1869,6 +2011,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var abandonMenuItem: NSMenuItem?
     private var currentTaskMenuItem: NSMenuItem?
     private var takeBreakNowMenuItem: NSMenuItem?
+    // The live top Todoist to-do the focus coach is tracking, shown in the menu.
+    private var topTodo: String = ""
     private var intradaySnoozeTimer: Timer?
     private let snoozeDuration: TimeInterval = 5 * 60
 
@@ -1896,6 +2040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         pomodoroScheduler.onWorkSessionEnd = { [weak self] in
             self?.focusMonitor.stop()
+            self?.topTodo = ""
             self?.showPomodoroBreak()
         }
         pomodoroScheduler.onBreakStart = { [weak self] in self?.caffeinator.breakStarted() }
@@ -1905,16 +2050,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInputDeferred() }
         pomodoroScheduler.onBreakSnoozeEnd = { [weak self] in self?.showPomodoroBreak() }
-        pomodoroScheduler.onWorkStart = { [weak self] task in
-            self?.focusMonitor.start(task: task)
+        pomodoroScheduler.onWorkStart = { [weak self] in
+            self?.focusMonitor.start()
             self?.caffeinator.workStarted()
         }
 
-        focusMonitor.onOffTaskDetected = { [weak self] appName, windowTitle, message in
-            self?.showFocusIntervention(appName: appName, windowTitle: windowTitle, message: message)
+        focusMonitor.onOffTaskDetected = { [weak self] message in
+            self?.showFocusIntervention(message: message)
         }
-        focusMonitor.onUpdateTask = { [weak self] newTask in
-            self?.pomodoroScheduler.currentTask = newTask
+        focusMonitor.onTopTodoChanged = { [weak self] todo in
+            self?.topTodo = todo ?? ""
         }
 
         calendarMonitor.start()
@@ -1936,18 +2081,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         switch url.host {
         case "start-pomodoro":
-            if let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-               let taskItem = components.queryItems?.first(where: { $0.name == "task" }),
-               let task = taskItem.value, !task.isEmpty {
-                if pomodoroScheduler.phase != .idle {
-                    pomodoroScheduler.abandon()
-                    caffeinator.sessionEnded()
-                }
-                pomodoroScheduler.workDurationOverride = availableWorkMinutes()
-                pomodoroScheduler.startWork(task: task)
-            } else {
-                showPomodoroTaskInput()
+            if pomodoroScheduler.phase != .idle {
+                pomodoroScheduler.abandon()
+                caffeinator.sessionEnded()
             }
+            pomodoroScheduler.workDurationOverride = availableWorkMinutes()
+            pomodoroScheduler.startWork()
         default:
             break
         }
@@ -1999,7 +2138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func updateMenuBarForPomodoro(seconds: Int, phase: PomodoroPhase) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let task = self.pomodoroScheduler.currentTask
+            let todo = self.topTodo
             switch phase {
             case .idle:
                 self.statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: "Experience Sampling")
@@ -2012,10 +2151,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let mins = seconds / 60
                 let secs = seconds % 60
                 self.statusItem.button?.title = String(format: "🍅 %02d:%02d", mins, secs)
-                self.statusItem.button?.toolTip = task.isEmpty ? nil : "Goal: \(task)"
+                self.statusItem.button?.toolTip = todo.isEmpty ? nil : "Top to-do: \(todo)"
                 self.abandonMenuItem?.isEnabled = true
-                self.currentTaskMenuItem?.title = "Goal: \(task)"
-                self.currentTaskMenuItem?.isHidden = task.isEmpty
+                self.currentTaskMenuItem?.title = "Top to-do: \(todo)"
+                self.currentTaskMenuItem?.isHidden = todo.isEmpty
             case .shortBreak, .longBreak:
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
@@ -2133,10 +2272,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }),
             snoozeDuration: pomodoroScheduler.snoozeDuration,
             workMinutes: workMins < defaultDuration ? workMins : nil,
-            onStart: { [weak self] task in
+            onStart: { [weak self] in
                 committed = true
                 self?.pomodoroScheduler.workDurationOverride = workMins
-                self?.pomodoroScheduler.startWork(task: task)
+                self?.pomodoroScheduler.startWork()
             },
             onSnooze: { [weak self] in
                 committed = true
@@ -2184,10 +2323,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }),
                 snoozeDuration: self.pomodoroScheduler.snoozeDuration,
                 workMinutes: workMins < defaultDuration ? workMins : nil,
-                onStartNext: { [weak self] task in
+                onStartNext: { [weak self] in
                     committed = true
                     self?.pomodoroScheduler.workDurationOverride = workMins
-                    self?.pomodoroScheduler.startWork(task: task)
+                    self?.pomodoroScheduler.startWork()
                 },
                 onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleSnooze() }
             )
@@ -2209,18 +2348,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func abandonPomodoro() {
         focusMonitor.stop()
+        topTodo = ""
         pomodoroScheduler.abandon()
         caffeinator.sessionEnded()
     }
 
-    private func showFocusIntervention(appName: String, windowTitle: String, message: String) {
+    private func showFocusIntervention(message: String) {
         var presented = true
         let view = FocusInterventionView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
             }),
             initialMessage: message,
-            currentTask: pomodoroScheduler.currentTask,
             onSendMessage: { [weak self] text, completion in
                 self?.focusMonitor.sendMessage(userText: text, completion: completion)
             },
