@@ -1724,47 +1724,6 @@ struct CombinedStartOfDayView: View {
     }
 }
 
-enum TaskInputFocus: Hashable {
-    case snooze
-    case start
-}
-
-struct PomodoroTaskInputView: View {
-    @Binding var isPresented: Bool
-    @FocusState private var focus: TaskInputFocus?
-    var snoozeDuration: Int
-    var workMinutes: Int?
-    var onStart: () -> Void
-    var onSnooze: () -> Void
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Start Pomodoro").font(.title2).fontWeight(.semibold)
-            if let mins = workMinutes {
-                Text("\(mins) min (meeting coming up)")
-                    .font(.caption).foregroundColor(.orange)
-            }
-            Text("The focus coach will keep you on your top to-do.")
-                .font(.caption).foregroundColor(.secondary)
-            HStack(spacing: 12) {
-                Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
-                    .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .snooze)
-                Button("Start") { onStart(); isPresented = false }
-                    .keyboardShortcut(.return, modifiers: [])
-                    .buttonStyle(.borderedProminent)
-                    .focused($focus, equals: .start)
-            }
-        }
-        .padding(24)
-        .frame(width: 320)
-        .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
-            focus = .start
-        }
-    }
-}
-
 enum BreakFocus: Hashable {
     case snooze
     case start
@@ -1799,46 +1758,6 @@ struct PomodoroBreakView: View {
         .onAppear {
             NSApp.activate(ignoringOtherApps: true)
             focus = .start
-        }
-    }
-}
-
-enum NextFocus: Hashable {
-    case snooze
-    case startNext
-}
-
-struct PomodoroNextView: View {
-    @Binding var isPresented: Bool
-    @FocusState private var focus: NextFocus?
-    var snoozeDuration: Int
-    var workMinutes: Int?
-    var onStartNext: () -> Void
-    var onSnooze: () -> Void
-
-    var body: some View {
-        VStack(spacing: 20) {
-            Text("Break's Over!").font(.title2).fontWeight(.semibold)
-            Text("Ready for another Pomodoro?")
-            if let mins = workMinutes {
-                Text("\(mins) min (meeting coming up)")
-                    .font(.caption).foregroundColor(.orange)
-            }
-            HStack(spacing: 12) {
-                Button("Snooze \(snoozeDuration) min") { onSnooze(); isPresented = false }
-                    .keyboardShortcut(.escape, modifiers: [])
-                    .focused($focus, equals: .snooze)
-                Button("Start Pomodoro") { onStartNext(); isPresented = false }
-                    .keyboardShortcut(.return, modifiers: [])
-                    .buttonStyle(.borderedProminent)
-                    .focused($focus, equals: .startNext)
-            }
-        }
-        .padding(24)
-        .frame(width: 320)
-        .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
-            focus = .startNext
         }
     }
 }
@@ -2046,9 +1965,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pomodoroScheduler.onBreakStart = { [weak self] in self?.caffeinator.breakStarted() }
         pomodoroScheduler.onBreakEnd = { [weak self] in
             self?.caffeinator.breakEnded()
-            self?.showPomodoroNext()
+            self?.startPomodoroDeferred()
         }
-        pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.showPomodoroTaskInputDeferred() }
+        pomodoroScheduler.onSnoozeEnd = { [weak self] in self?.startPomodoroDeferred() }
         pomodoroScheduler.onBreakSnoozeEnd = { [weak self] in self?.showPomodoroBreak() }
         pomodoroScheduler.onWorkStart = { [weak self] in
             self?.focusMonitor.start()
@@ -2100,7 +2019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Check in now", action: #selector(showIntradayPrompt), keyEquivalent: "c"))
         menu.addItem(.separator())
 
-        menu.addItem(NSMenuItem(title: "Start Pomodoro", action: #selector(showPomodoroTaskInput), keyEquivalent: "p"))
+        menu.addItem(NSMenuItem(title: "Start Pomodoro", action: #selector(startPomodoroFromMenu), keyEquivalent: "p"))
         let currentTask = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         currentTask.isEnabled = false
         currentTask.isHidden = true
@@ -2232,7 +2151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.promptWindow?.close()
-                self?.showPomodoroTaskInput()
+                self?.startPomodoroNow()
             },
             onSnooze: { [weak self] excitement in
                 committed = true
@@ -2251,43 +2170,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
     }
 
-    @objc private func showPomodoroTaskInput() {
-        presentPomodoroTaskInput()
+    @objc private func startPomodoroFromMenu() {
+        startPomodoroNow()
     }
 
-    private func showPomodoroTaskInputDeferred() {
+    /// Start a work pomodoro right now, capping the duration if a meeting is
+    /// near. Used for explicit user actions (start-of-day "Start Pomodoro"
+    /// button, dropdown menu) — there is no longer a confirmation modal since
+    /// the per-pomodoro goal was removed.
+    private func startPomodoroNow() {
         guard pomodoroScheduler.phase == .idle else { return }
-        deferIfMeeting { [weak self] in self?.presentPomodoroTaskInput() }
+        pomodoroScheduler.workDurationOverride = availableWorkMinutes()
+        pomodoroScheduler.startWork()
     }
 
-    private func presentPomodoroTaskInput() {
+    /// Start a work pomodoro, but if the user is in (or about to enter) a
+    /// meeting, defer until it clears. Used for automatic triggers (snooze
+    /// expiry, break end) where we don't want to interrupt a meeting.
+    private func startPomodoroDeferred() {
         guard pomodoroScheduler.phase == .idle else { return }
-        let workMins = availableWorkMinutes()
-        let defaultDuration = pomodoroScheduler.workDuration
-        var presented = true
-        var committed = false
-        let view = PomodoroTaskInputView(
-            isPresented: Binding(get: { presented }, set: { [weak self] v in
-                presented = v; if !v { self?.promptWindow?.close() }
-            }),
-            snoozeDuration: pomodoroScheduler.snoozeDuration,
-            workMinutes: workMins < defaultDuration ? workMins : nil,
-            onStart: { [weak self] in
-                committed = true
-                self?.pomodoroScheduler.workDurationOverride = workMins
-                self?.pomodoroScheduler.startWork()
-            },
-            onSnooze: { [weak self] in
-                committed = true
-                self?.pomodoroScheduler.scheduleSnooze()
-            }
-        )
-        // Snooze on any close that isn't an explicit Start/Snooze — covers the
-        // native X and programmatic replacement by another prompt's showWindow,
-        // so the prompt is never silently lost.
-        showWindow(view, onClose: { [weak self] in
-            if !committed { self?.pomodoroScheduler.scheduleSnooze() }
-        })
+        deferIfMeeting { [weak self] in self?.startPomodoroNow() }
     }
 
     private func showPomodoroBreak() {
@@ -2308,32 +2210,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showWindow(view, onClose: { [weak self] in
             if !committed { self?.pomodoroScheduler.scheduleBreakSnooze() }
         })
-    }
-
-    private func showPomodoroNext() {
-        deferIfMeeting { [weak self] in
-            guard let self else { return }
-            let workMins = self.availableWorkMinutes()
-            let defaultDuration = self.pomodoroScheduler.workDuration
-            var presented = true
-            var committed = false
-            let view = PomodoroNextView(
-                isPresented: Binding(get: { presented }, set: { [weak self] v in
-                    presented = v; if !v { self?.promptWindow?.close() }
-                }),
-                snoozeDuration: self.pomodoroScheduler.snoozeDuration,
-                workMinutes: workMins < defaultDuration ? workMins : nil,
-                onStartNext: { [weak self] in
-                    committed = true
-                    self?.pomodoroScheduler.workDurationOverride = workMins
-                    self?.pomodoroScheduler.startWork()
-                },
-                onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleSnooze() }
-            )
-            self.showWindow(view, onClose: { [weak self] in
-                if !committed { self?.pomodoroScheduler.scheduleSnooze() }
-            })
-        }
     }
 
     @objc private func takeBreakNow() {
