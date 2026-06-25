@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The workflow only typechecks and runs tests; it needs no write access.
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same ref when new commits arrive.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # macOS runner: the app links AppKit/SwiftUI/CoreMediaIO/CoreAudio and the
+    # tests build the app source, so a Linux Swift toolchain won't work.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Typecheck app
+        # Mirrors the typecheck step in rebuild-and-restart.sh.
+        run: swiftc -parse-as-library -typecheck ExperienceSampling/ExperienceSampling.swift
+
+      - name: Run tests
+        # run-tests.sh skips codesigning when CODESIGN_CERT is unset (no Santa
+        # on CI runners), so it builds and runs the test binary directly.
+        run: ./run-tests.sh
