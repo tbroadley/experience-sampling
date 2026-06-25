@@ -39,14 +39,29 @@ jobs:
 
   lint:
     runs-on: macos-26
+    env:
+      # Pinned so lint results are reproducible; bump deliberately.
+      SWIFTLINT_VERSION: "0.64.1"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      - name: Install SwiftLint
-        # Preinstalled on GitHub macOS images, but install on demand if absent.
-        run: command -v swiftlint >/dev/null || brew install swiftlint
+      - name: Cache SwiftLint
+        id: cache-swiftlint
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .swiftlint-bin
+          key: swiftlint-${{ env.SWIFTLINT_VERSION }}-macos-26
+
+      - name: Download SwiftLint
+        # Official portable binary (no brew dependency resolution). Cached above,
+        # so this only runs on a cache miss / version bump.
+        if: steps.cache-swiftlint.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .swiftlint-bin
+          curl -fsSL "https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/portable_swiftlint.zip" -o swiftlint.zip
+          unzip -oq swiftlint.zip swiftlint -d .swiftlint-bin
 
       - name: Lint
         # Config (.swiftlint.yml) targets the source via `included:`.
         # --strict promotes warnings to errors so the build fails on any finding.
-        run: swiftlint lint --strict
+        run: ./.swiftlint-bin/swiftlint lint --strict
