@@ -28,7 +28,12 @@ swiftc -DTESTING \
 
 if [[ -n "${CODESIGN_CERT:-}" ]]; then
   echo "==> Codesigning test binary"
-  codesign --force --sign "$CODESIGN_CERT" "$BIN"
+  # No --force: swiftc/ld emit a *linker-signed* ad-hoc signature, which codesign
+  # replaces without --force. --force is only needed to clobber a *real* signature,
+  # which never happens here since $BIN is always freshly compiled above. Omitting
+  # it also avoids Santa --force alerts and surfaces (rather than silently
+  # overwriting) any unexpected pre-existing signature.
+  codesign --sign "$CODESIGN_CERT" "$BIN"
 else
   echo "==> CODESIGN_CERT not set, skipping codesign (expected on CI)"
 fi
