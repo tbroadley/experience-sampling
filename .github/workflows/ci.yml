@@ -36,3 +36,17 @@ jobs:
         # run-tests.sh skips codesigning when CODESIGN_CERT is unset (no Santa
         # on CI runners), so it builds and runs the test binary directly.
         run: ./run-tests.sh
+
+  lint:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install SwiftLint
+        # Preinstalled on GitHub macOS images, but install on demand if absent.
+        run: command -v swiftlint >/dev/null || brew install swiftlint
+
+      - name: Lint
+        # Config (.swiftlint.yml) targets the source via `included:`.
+        # --strict promotes warnings to errors so the build fails on any finding.
+        run: swiftlint lint --strict

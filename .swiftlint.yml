@@ -1,0 +1,32 @@
+# SwiftLint config for ExperienceSampling.
+#
+# The app is intentionally a single Swift file (see CLAUDE.md), so the
+# size/length rules that assume a multi-file project are disabled rather than
+# fought. Everything else keeps SwiftLint's defaults.
+
+included:
+  - ExperienceSampling/ExperienceSampling.swift
+
+disabled_rules:
+  # Architectural: the app is deliberately one file with large view/manager
+  # types, so these fire constantly without signalling a real problem.
+  - file_length
+  - type_body_length
+  - function_body_length
+  - large_tuple
+  # Fights idiomatic SwiftUI, e.g. `Button(action: {…}) { Text(…) }`.
+  - multiple_closures_with_trailing_closure
+
+# Short local bindings (v, nc, f, …) are fine; only flag genuinely long names.
+identifier_name:
+  min_length: 0
+  max_length:
+    warning: 50
+    error: 60
+
+# Allow longer lines than the 120 default; only flag truly unwieldy ones.
+line_length:
+  warning: 200
+  error: 250
+  ignores_comments: true
+  ignores_urls: true

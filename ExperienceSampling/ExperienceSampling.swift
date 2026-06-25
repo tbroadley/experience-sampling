@@ -230,10 +230,8 @@ final class PromptScheduler: ObservableObject {
             }.sorted()
 
             let minGap: TimeInterval = 10 * 60
-            for i in 1..<promptTimes.count {
-                if promptTimes[i].timeIntervalSince(promptTimes[i - 1]) < minGap {
-                    promptTimes[i] = promptTimes[i - 1].addingTimeInterval(minGap)
-                }
+            for i in 1..<promptTimes.count where promptTimes[i].timeIntervalSince(promptTimes[i - 1]) < minGap {
+                promptTimes[i] = promptTimes[i - 1].addingTimeInterval(minGap)
             }
 
             for time in promptTimes where time < endOfWork {
@@ -905,8 +903,8 @@ final class CalendarMonitor {
             "/usr/local/bin/gws",
             "/opt/homebrew/bin/gws"
         ]
-        for c in candidates {
-            if FileManager.default.isExecutableFile(atPath: c) { return c }
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
+            return c
         }
         return "/usr/local/bin/gws"
     }
@@ -967,7 +965,7 @@ enum TodoistClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         // resource_types=["items"], percent-encoded.
-        request.httpBody = "sync_token=*&resource_types=%5B%22items%22%5D".data(using: .utf8)
+        request.httpBody = Data("sync_token=*&resource_types=%5B%22items%22%5D".utf8)
         request.timeoutInterval = 15
 
         URLSession.shared.dataTask(with: request) { data, response, error in
@@ -1386,6 +1384,7 @@ final class FocusMonitor {
         var windowValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowValue) == .success else { return nil }
         var titleValue: CFTypeRef?
+        // swiftlint:disable:next force_cast - AXUIElementCopyAttributeValue guarantees an AXUIElement here.
         guard AXUIElementCopyAttributeValue(windowValue as! AXUIElement, kAXTitleAttribute as CFString, &titleValue) == .success else { return nil }
         return titleValue as? String
     }
@@ -1501,7 +1500,7 @@ enum IntradayFocus: Hashable {
 struct IntradayView: View {
     @Binding var isPresented: Bool
     @State private var activity: String = ""
-    @State private var excitement: Int? = nil
+    @State private var excitement: Int?
     @FocusState private var focus: IntradayFocus?
     var onSubmit: (String, Int) -> Void
     var onSnooze: () -> Void
@@ -1687,7 +1686,7 @@ enum CombinedStartFocus: Hashable {
 }
 
 struct CombinedStartOfDayView: View {
-    @State private var excitement: Int? = nil
+    @State private var excitement: Int?
     @FocusState private var focus: CombinedStartFocus?
     var snoozeDuration: Int
     var onStartPomodoro: (Int) -> Void

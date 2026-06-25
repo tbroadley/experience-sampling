@@ -30,7 +30,9 @@ swiftc -parse-as-library -typecheck "$SRC_FILE"
 
 if command -v swiftlint >/dev/null 2>&1; then
   echo "==> Linting with swiftlint"
-  swiftlint lint --path "$SRC_FILE"
+  # Config (.swiftlint.yml) targets the source via `included:`; run from the
+  # repo root so it's picked up. --strict matches CI (warnings fail the build).
+  (cd "$ROOT_DIR" && swiftlint lint --strict)
 else
   echo "==> swiftlint not found, skipping lint step"
 fi
