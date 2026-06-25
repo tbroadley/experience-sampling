@@ -18,9 +18,9 @@ jobs:
   test:
     # macOS runner: the app links AppKit/SwiftUI/CoreMediaIO/CoreAudio and the
     # tests build the app source, so a Linux Swift toolchain won't work.
-    # Pinned (not macos-latest) to avoid the toolchain shifting under us when
-    # the latest label migrates to a new macOS image.
-    runs-on: macos-15
+    # Pinned to macos-26 (not macos-latest) to match the macOS version we
+    # develop and ship on, so CI catches breakage on that toolchain.
+    runs-on: macos-26
     steps:
       # Pinned to a commit SHA (v5.0.1) for supply-chain safety.
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
