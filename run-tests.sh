@@ -15,19 +15,23 @@ BUILD_DIR="$(mktemp -d)"
 BIN="$BUILD_DIR/estests"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
-# Santa (binary authorization) SIGKILLs unsigned binaries, so the test binary
-# must be codesigned with the same cert the app build uses.
-if [[ ! -f "$ENV_FILE" ]]; then echo "Missing $ENV_FILE"; exit 1; fi
-set -a; source "$ENV_FILE"; set +a
-if [[ -z "${CODESIGN_CERT:-}" ]]; then echo "CODESIGN_CERT is not set in $ENV_FILE"; exit 1; fi
+# Santa (binary authorization) SIGKILLs unsigned binaries on managed Macs, so
+# locally the test binary must be codesigned with the same cert the app build
+# uses. CI runners (e.g. GitHub-hosted macOS) have no Santa and no cert, so
+# codesigning is skipped there: .env and CODESIGN_CERT are both optional.
+if [[ -f "$ENV_FILE" ]]; then set -a; source "$ENV_FILE"; set +a; fi
 
 echo "==> Building tests"
 swiftc -DTESTING \
   -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio \
   "$SRC" "$TST" -o "$BIN"
 
-echo "==> Codesigning test binary"
-codesign --force --sign "$CODESIGN_CERT" "$BIN"
+if [[ -n "${CODESIGN_CERT:-}" ]]; then
+  echo "==> Codesigning test binary"
+  codesign --force --sign "$CODESIGN_CERT" "$BIN"
+else
+  echo "==> CODESIGN_CERT not set, skipping codesign (expected on CI)"
+fi
 
 echo "==> Running tests (isolated home dir)"
 # macOS NSHomeDirectory() ignores $HOME (it reads the directory service), so
