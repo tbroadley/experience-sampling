@@ -61,7 +61,12 @@ mkdir -p "$(dirname "$TMP_BIN")"
 swiftc -O -parse-as-library -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio "$SRC_FILE" -o "$TMP_BIN"
 
 echo "==> Codesigning temporary app bundle"
-codesign --force --sign "$CODESIGN_CERT" "$TMP_APP"
+# No --force: the bundle's inner binary was just rebuilt by swiftc above, so it
+# carries only a *linker-signed* ad-hoc signature, which codesign replaces without
+# --force (the copied bundle's stale real signature is on the now-overwritten
+# binary). --force is only needed to clobber a real signature, which never occurs
+# here. Omitting it avoids Santa --force alerts.
+codesign --sign "$CODESIGN_CERT" "$TMP_APP"
 
 echo "==> Installing app bundle"
 rm -rf "$DEST_APP"
