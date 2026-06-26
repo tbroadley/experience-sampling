@@ -1449,7 +1449,330 @@ final class FocusMonitor {
     }
 }
 
+// MARK: - Meeting Attention Monitor
+
+/// Nudges the user back when they drift away from a live meeting. "In a meeting"
+/// is inferred from the mic or camera being active (covers Meet, Zoom, etc.); a
+/// drift is lingering on a non-allowlisted app/tab past a threshold. The browser
+/// is special-cased because it's where Meet lives *and* where most distractions
+/// live: it counts as "on the meeting" only while its focused-window title looks
+/// like a meeting tab. The decision is split into the pure `classify`/`step`
+/// methods so it can be unit-tested headlessly without timers or live AV state.
+final class MeetingAttentionMonitor {
+    enum Decision: Equatable {
+        case onMeeting    // on the Meet/Zoom tab — fine
+        case allowed      // an allowlisted app (notes, to-dos, screen share) — fine
+        case distraction  // somewhere else — accrue linger time
+    }
+
+    private var timer: Timer?
+    private var lingerStart: Date?
+    private var isShowingNudge = false
+    private var snoozedUntilMeetingEnd = false
+    private var avInactiveCount = 0
+    private(set) var lastContext = ""
+    private var inMeetingContext = false
+    private var lastContextRefresh: Date?
+
+    let pollInterval: TimeInterval = 5
+    // ~3 polls (15s) of no mic/camera before we treat the meeting as over and
+    // lift a snooze. A brief AV blip (e.g. muting) shouldn't reset the snooze.
+    let avChecksBeforeMeetingEnd = 3
+    // The Meet/Zoom probe (AppleScript / AX) is comparatively expensive, so its
+    // result is cached and refreshed at most this often.
+    let contextRefreshInterval: TimeInterval = 20
+
+    /// Whether a scheduled calendar event is happening now. Injected by the app
+    /// (wired to `CalendarMonitor.isInMeeting`) so the monitor stays decoupled.
+    var isInScheduledMeeting: () -> Bool = { false }
+
+    var isEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "meetingAttentionEnabled") as? Bool) ?? true
+    }
+    var lingerThreshold: TimeInterval {
+        TimeInterval(UserDefaults.standard.integer(forKey: "meetingLingerSeconds").nonZeroOr(25))
+    }
+    static let defaultAllowlist = "Notion,Todoist,zoom.us,screencaptureui"
+    var allowlist: [String] {
+        let raw = UserDefaults.standard.string(forKey: "meetingAllowlist")
+        let source = (raw?.isEmpty == false) ? raw! : Self.defaultAllowlist
+        return source.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    var onNudge: (() -> Void)?
+
+    // MARK: Pure decision
+
+    static func classify(appName: String,
+                         windowTitle: String?,
+                         allowlist: [String],
+                         browserNames: [String] = ["Chrome", "Safari", "Arc", "Brave", "Microsoft Edge", "Firefox"],
+                         meetingMarkers: [String] = ["Meet", "Google Meet", "Zoom", "Webex"]) -> Decision {
+        if allowlist.contains(where: { appName.localizedCaseInsensitiveContains($0) }) {
+            return .allowed
+        }
+        if browserNames.contains(where: { appName.localizedCaseInsensitiveContains($0) }) {
+            // Without a readable tab title (Accessibility not granted yet) we
+            // can't tell the Meet tab from any other — err toward not nagging.
+            guard let title = windowTitle, !title.isEmpty else { return .onMeeting }
+            return meetingMarkers.contains(where: { title.localizedCaseInsensitiveContains($0) }) ? .onMeeting : .distraction
+        }
+        return .distraction
+    }
+
+    /// One evaluation step. Mutates linger/snooze state and returns true exactly
+    /// when a nudge should fire. Driven by the real timer with live signals;
+    /// exposed so headless tests can step it with injected time/signals.
+    func step(now: Date, meetingActive: Bool, appName: String, windowTitle: String?) -> Bool {
+        guard isEnabled else { return false }
+
+        guard meetingActive else {
+            lingerStart = nil
+            avInactiveCount += 1
+            if avInactiveCount >= avChecksBeforeMeetingEnd {
+                snoozedUntilMeetingEnd = false
+                avInactiveCount = 0
+            }
+            return false
+        }
+        avInactiveCount = 0
+
+        guard !snoozedUntilMeetingEnd, !isShowingNudge else { return false }
+
+        lastContext = windowTitle.map { "\(appName) — \($0)" } ?? appName
+        switch Self.classify(appName: appName, windowTitle: windowTitle, allowlist: allowlist) {
+        case .onMeeting, .allowed:
+            lingerStart = nil
+            return false
+        case .distraction:
+            guard let start = lingerStart else { lingerStart = now; return false }
+            guard now.timeIntervalSince(start) >= lingerThreshold else { return false }
+            lingerStart = nil
+            isShowingNudge = true
+            return true
+        }
+    }
+
+    // MARK: Nudge outcomes (called from the app's nudge window)
+
+    /// User said the drift is intentional — stop nudging until this meeting ends.
+    func snoozeForMeeting() { snoozedUntilMeetingEnd = true; isShowingNudge = false; lingerStart = nil }
+    /// Nudge dismissed (returned to the meeting, or window closed) — re-arm.
+    func dismissNudge() { isShowingNudge = false; lingerStart = nil }
+
+    // MARK: Lifecycle
+
+    func start() {
+        guard isEnabled else { return }
+        reset()
+        requestAccessibilityIfNeeded()
+        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    func stop() { timer?.invalidate(); timer = nil }
+
+    private func reset() {
+        lingerStart = nil
+        isShowingNudge = false
+        snoozedUntilMeetingEnd = false
+        avInactiveCount = 0
+        lastContext = ""
+        inMeetingContext = false
+        lastContextRefresh = nil
+    }
+
+    private func tick() {
+        let now = Date()
+        let av = CalendarMonitor.isCameraRunning() || CalendarMonitor.isMicRunning()
+        // A live mic/camera alone isn't a meeting — Wispr Flow dictation also
+        // holds the mic. Require a real meeting context too: a scheduled calendar
+        // event, or an open Meet/Zoom/Teams call. The context probe (AppleScript /
+        // AX) is comparatively expensive, so `&&` short-circuits it away whenever
+        // AV is off, and `meetingContext` caches it while AV is on.
+        let meetingActive = av && meetingContext(now: now)
+
+        guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
+        if frontApp.bundleIdentifier == "org.metr.ExperienceSampling" { return }
+        let appName = frontApp.localizedName ?? "Unknown"
+        let title = Self.windowTitle(pid: frontApp.processIdentifier)
+        if step(now: now, meetingActive: meetingActive, appName: appName, windowTitle: title) {
+            logEvent(context: lastContext)
+            DispatchQueue.main.async { [weak self] in self?.onNudge?() }
+        }
+    }
+
+    /// Cached "are we in a real meeting context" check, refreshed at most every
+    /// `contextRefreshInterval`. Only called while AV is active (see `tick`).
+    private func meetingContext(now: Date) -> Bool {
+        if let last = lastContextRefresh, now.timeIntervalSince(last) < contextRefreshInterval {
+            return inMeetingContext
+        }
+        lastContextRefresh = now
+        inMeetingContext = isInScheduledMeeting() || Self.meetingCallOpen()
+        return inMeetingContext
+    }
+
+    private func requestAccessibilityIfNeeded() {
+        if !AXIsProcessTrusted() {
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+        }
+    }
+
+    static func windowTitle(pid: pid_t) -> String? {
+        let appElement = AXUIElementCreateApplication(pid)
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &windowValue) == .success else { return nil }
+        var titleValue: CFTypeRef?
+        // swiftlint:disable:next force_cast - AXUIElementCopyAttributeValue guarantees an AXUIElement here.
+        guard AXUIElementCopyAttributeValue(windowValue as! AXUIElement, kAXTitleAttribute as CFString, &titleValue) == .success else { return nil }
+        return titleValue as? String
+    }
+
+    // MARK: Meeting-call detection (no Screen Recording required)
+
+    // URL fragments that mean "a video call is open in this tab". Covers Google
+    // Meet, Microsoft Teams (work + personal), and Zoom's web client.
+    static let meetingURLMarkers = ["meet.google.com", "teams.microsoft.com", "teams.live.com", "zoom.us/wc", "zoom.us/j"]
+    // Chromium-family browsers share one AppleScript dialect for tab URLs.
+    static let chromiumBrowsers: [(bundleID: String, appName: String)] = [
+        ("com.google.Chrome", "Google Chrome"),
+        ("com.brave.Browser", "Brave Browser"),
+        ("com.microsoft.edgemac", "Microsoft Edge"),
+        ("company.thebrowser.Browser", "Arc"),
+        ("com.vivaldi.Vivaldi", "Vivaldi")
+    ]
+    // Native call apps and the window-title marker that means "in a call".
+    static let callApps: [(bundleID: String, titleMarker: String)] = [
+        ("us.zoom.xos", "Zoom Meeting")
+    ]
+
+    /// Best-effort: is a Google Meet / Teams / Zoom call currently open? Checks
+    /// native call apps via the Accessibility API and browser tabs via AppleScript
+    /// (one-time Automation permission per browser). All probes fail silently.
+    static func meetingCallOpen() -> Bool {
+        if callAppInMeeting() { return true }
+        if browserHasMeetingTab() { return true }
+        return false
+    }
+
+    static func callAppInMeeting() -> Bool {
+        let running = NSWorkspace.shared.runningApplications
+        for app in callApps {
+            guard let proc = running.first(where: { $0.bundleIdentifier == app.bundleID }) else { continue }
+            let appEl = AXUIElementCreateApplication(proc.processIdentifier)
+            var windowsVal: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(appEl, kAXWindowsAttribute as CFString, &windowsVal) == .success,
+                  let windows = windowsVal as? [AXUIElement] else { continue }
+            for window in windows {
+                var titleVal: CFTypeRef?
+                if AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleVal) == .success,
+                   let title = titleVal as? String,
+                   title.localizedCaseInsensitiveContains(app.titleMarker) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    static func browserHasMeetingTab() -> Bool {
+        let running = Set(NSWorkspace.shared.runningApplications.compactMap { $0.bundleIdentifier })
+        let condition = meetingURLMarkers
+            .map { "(theURL contains \"\($0)\")" }
+            .joined(separator: " or ")
+
+        for browser in chromiumBrowsers where running.contains(browser.bundleID) {
+            let script = """
+            tell application "\(browser.appName)"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        set theURL to URL of t
+                        if \(condition) then return true
+                    end repeat
+                end repeat
+            end tell
+            return false
+            """
+            if runAppleScriptReturnsTrue(script) { return true }
+        }
+
+        if running.contains("com.apple.Safari") {
+            let script = """
+            tell application "Safari"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        set theURL to URL of t
+                        if \(condition) then return true
+                    end repeat
+                end repeat
+            end tell
+            return false
+            """
+            if runAppleScriptReturnsTrue(script) { return true }
+        }
+        return false
+    }
+
+    private static func runAppleScriptReturnsTrue(_ source: String) -> Bool {
+        guard let script = NSAppleScript(source: source) else { return false }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        guard error == nil else { return false }
+        return result.booleanValue
+    }
+
+    private func logEvent(context: String) {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let logFile = appSupport.appendingPathComponent("ExperienceSampling/meeting-attention-log.jsonl")
+        let entry: [String: Any] = [
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "context": context,
+            "linger_seconds": Int(lingerThreshold)
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: entry),
+              let line = String(data: data, encoding: .utf8) else { return }
+        let lineWithNewline = line + "\n"
+        if let handle = try? FileHandle(forWritingTo: logFile) {
+            handle.seekToEndOfFile()
+            handle.write(lineWithNewline.data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            try? lineWithNewline.write(to: logFile, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
 // MARK: - Views
+
+/// Gentle nudge shown when the user drifts away from a live meeting. Two ways
+/// out: return to the meeting (re-arms), or declare the drift intentional (mutes
+/// nudges for the rest of this meeting — the heads-down-in-notes escape hatch).
+struct MeetingNudgeView: View {
+    var onBack: () -> Void
+    var onSnooze: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Still in a meeting?").font(.title2).fontWeight(.semibold)
+            Text("You've drifted away from the meeting for a bit. Head back, or let me know you're away on purpose and I'll stay quiet for the rest of this meeting.")
+                .multilineTextAlignment(.center)
+                .foregroundColor(.secondary)
+            HStack(spacing: 12) {
+                Button("I'm here on purpose") { onSnooze() }
+                    .keyboardShortcut(.escape, modifiers: [])
+                Button("Back to the meeting") { onBack() }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 360)
+        .onAppear { NSApp.activate(ignoringOtherApps: true) }
+    }
+}
 
 struct LikertScale: View {
     @Binding var selectedValue: Int?
@@ -1594,6 +1917,9 @@ struct SettingsView: View {
     @AppStorage("pomodoroBreakSnooze") private var breakSnooze = 5
     @AppStorage("focusMonitorEnabled") private var focusEnabled = true
     @AppStorage("focusCheckInterval") private var focusInterval = 30
+    @AppStorage("meetingAttentionEnabled") private var meetingAttentionEnabled = true
+    @AppStorage("meetingLingerSeconds") private var meetingLingerSeconds = 25
+    @AppStorage("meetingAllowlist") private var meetingAllowlist = MeetingAttentionMonitor.defaultAllowlist
 
     @State private var selectedTab = 0
     @State private var apiKey: String = ""
@@ -1650,9 +1976,26 @@ struct SettingsView: View {
             }
             .tabItem { Label("Focus", systemImage: "eye") }
             .tag(2)
+
+            Form {
+                Toggle("Nudge me when I drift during meetings", isOn: $meetingAttentionEnabled)
+                Stepper("Nudge after \(meetingLingerSeconds)s away", value: $meetingLingerSeconds, in: 10...120, step: 5)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Meeting-OK apps (comma-separated)").font(.caption).foregroundColor(.secondary)
+                    TextField("Notion,Todoist,…", text: $meetingAllowlist)
+                }
+                Text("""
+                In a meeting (mic/camera on), lingering on anything else past the threshold \
+                triggers a nudge. The browser counts as the meeting only on a Meet/Zoom tab. \
+                Takes effect on next app launch.
+                """)
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            .tabItem { Label("Meetings", systemImage: "person.2.wave.2") }
+            .tag(3)
         }
         .padding()
-        .frame(width: 320, height: 280)
+        .frame(width: 340, height: 320)
         .onAppear { loadAPIKey(); loadTodoistToken() }
     }
 
@@ -1964,6 +2307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let wakeDetector = WakeDetector()
     private let pomodoroScheduler = PomodoroScheduler()
     private let focusMonitor = FocusMonitor()
+    private let meetingMonitor = MeetingAttentionMonitor()
     private let calendarMonitor = CalendarMonitor()
     private let caffeinator = BreakCaffeinator()
     private var abandonMenuItem: NSMenuItem?
@@ -2019,6 +2363,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         focusMonitor.onTopTodoChanged = { [weak self] todo in
             self?.topTodo = todo ?? ""
         }
+
+        meetingMonitor.onNudge = { [weak self] in self?.showMeetingNudge() }
+        meetingMonitor.isInScheduledMeeting = { [weak self] in self?.calendarMonitor.isInMeeting() ?? false }
+        meetingMonitor.start()
 
         calendarMonitor.start()
         pomodoroScheduler.restoreState()
@@ -2318,6 +2666,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // isShowingIntervention flag. Idempotent with the button handlers.
         showWindow(view, allowClose: false, onClose: { [weak self] in
             self?.focusMonitor.resumeAfterIntervention()
+        })
+    }
+
+    private func showMeetingNudge() {
+        var committed = false
+        let view = MeetingNudgeView(
+            onBack: { [weak self] in
+                committed = true
+                self?.meetingMonitor.dismissNudge()
+                self?.promptWindow?.close()
+            },
+            onSnooze: { [weak self] in
+                committed = true
+                self?.meetingMonitor.snoozeForMeeting()
+                self?.promptWindow?.close()
+            }
+        )
+        // Any other close path (native X, or another prompt's showWindow replacing
+        // this one) re-arms the monitor rather than leaving it stuck showing.
+        showWindow(view, onClose: { [weak self] in
+            if !committed { self?.meetingMonitor.dismissNudge() }
         })
     }
 

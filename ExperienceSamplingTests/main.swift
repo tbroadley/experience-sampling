@@ -345,6 +345,78 @@ do {
     check(!caffeinated(), "abandoning stops caffeination")
 }
 
+// MARK: - MeetingAttentionMonitor
+
+section("MeetingAttentionMonitor.classify")
+do {
+    typealias M = MeetingAttentionMonitor
+    let allow = ["Notion", "Todoist", "zoom.us"]
+    checkEqual(M.classify(appName: "Google Chrome", windowTitle: "Meet — Standup", allowlist: allow),
+               M.Decision.onMeeting, "browser on a Meet tab -> onMeeting")
+    checkEqual(M.classify(appName: "Google Chrome", windowTitle: "Hacker News", allowlist: allow),
+               M.Decision.distraction, "browser on a non-meeting tab -> distraction")
+    checkEqual(M.classify(appName: "Safari", windowTitle: nil, allowlist: allow),
+               M.Decision.onMeeting, "browser with unreadable title -> onMeeting (don't nag without AX)")
+    checkEqual(M.classify(appName: "Notion", windowTitle: "Meeting notes", allowlist: allow),
+               M.Decision.allowed, "allowlisted app -> allowed")
+    checkEqual(M.classify(appName: "zoom.us", windowTitle: "Zoom Meeting", allowlist: allow),
+               M.Decision.allowed, "native Zoom app (allowlisted) -> allowed")
+    checkEqual(M.classify(appName: "Slack", windowTitle: "general", allowlist: allow),
+               M.Decision.distraction, "non-allowlisted, non-browser app -> distraction")
+}
+
+section("MeetingAttentionMonitor: linger accrues to the threshold, then nudges")
+do {
+    let m = MeetingAttentionMonitor()
+    let t0 = Date(timeIntervalSince1970: 1_000_000)
+    check(!m.step(now: t0, meetingActive: true, appName: "Slack", windowTitle: nil),
+          "first distraction step arms the linger clock, no nudge yet")
+    check(!m.step(now: t0.addingTimeInterval(10), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "still under the 25s threshold")
+    check(m.step(now: t0.addingTimeInterval(30), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "past the threshold -> nudge")
+    check(!m.step(now: t0.addingTimeInterval(35), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "while the nudge is showing, no repeat nudge")
+}
+
+section("MeetingAttentionMonitor: returning to the meeting resets the linger clock")
+do {
+    let m = MeetingAttentionMonitor()
+    let t0 = Date(timeIntervalSince1970: 2_000_000)
+    _ = m.step(now: t0, meetingActive: true, appName: "Slack", windowTitle: nil)
+    check(!m.step(now: t0.addingTimeInterval(5), meetingActive: true, appName: "Google Chrome", windowTitle: "Meet — x"),
+          "back on the Meet tab clears the clock")
+    check(!m.step(now: t0.addingTimeInterval(40), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "drifting again restarts the clock from scratch (no immediate nudge)")
+}
+
+section("MeetingAttentionMonitor: no meeting (mic/camera off) never nudges")
+do {
+    let m = MeetingAttentionMonitor()
+    let t0 = Date(timeIntervalSince1970: 5_000_000)
+    _ = m.step(now: t0, meetingActive: false, appName: "Slack", windowTitle: nil)
+    check(!m.step(now: t0.addingTimeInterval(60), meetingActive: false, appName: "Slack", windowTitle: nil),
+          "not in a meeting -> no nudge no matter how long")
+}
+
+section("MeetingAttentionMonitor: dismiss re-arms; snooze mutes until the meeting ends")
+do {
+    let m = MeetingAttentionMonitor()
+    let t0 = Date(timeIntervalSince1970: 3_000_000)
+    _ = m.step(now: t0, meetingActive: true, appName: "Slack", windowTitle: nil)
+    check(m.step(now: t0.addingTimeInterval(30), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "nudge fires")
+    m.snoozeForMeeting()
+    check(!m.step(now: t0.addingTimeInterval(120), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "snoozed -> no nudge for the rest of the meeting")
+    for i in 0..<3 {
+        _ = m.step(now: t0.addingTimeInterval(130 + Double(i)), meetingActive: false, appName: "Slack", windowTitle: nil)
+    }
+    _ = m.step(now: t0.addingTimeInterval(200), meetingActive: true, appName: "Slack", windowTitle: nil)
+    check(m.step(now: t0.addingTimeInterval(230), meetingActive: true, appName: "Slack", windowTitle: nil),
+          "once the meeting ends (sustained AV-off) the snooze lifts and nudges resume")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")
