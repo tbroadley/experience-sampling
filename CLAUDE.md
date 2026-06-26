@@ -41,6 +41,29 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
 - `anthropic-api-key.txt` - Claude API key for the focus coach
 - `todoist-api-token.txt` - Todoist API token (set in Settings → Focus)
 - `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
+- `meeting-attention-log.jsonl` - one line per meeting-drift nudge (`context`, `linger_seconds`)
+
+## Meeting Attention
+
+`MeetingAttentionMonitor` nudges the user back when they drift away from a live
+meeting. "In a meeting" = mic/camera active **AND** a real meeting context: a
+current calendar event (`isInScheduledMeeting`, wired to `CalendarMonitor.isInMeeting()`)
+**or** an open Meet/Teams/Zoom call (`meetingCallOpen()`). The AND is essential —
+mic-alone is not enough because Wispr Flow dictation also holds the mic; the calendar
+/ call check is what excludes dictation. The call probe checks native call apps via
+the Accessibility API (`callApps`, e.g. Zoom's "Zoom Meeting" window) and browser
+tabs via AppleScript (`meetingURLMarkers` across Chromium browsers + Safari; one-time
+Automation permission per browser). It's throttled (`contextRefreshInterval`, 20s)
+and only runs while AV is active, so dictation doesn't pay for it constantly.
+A drift = lingering past a threshold
+(default 25s) on something that isn't allowlisted. The browser is special-cased:
+it counts as "on the meeting" only while its focused-window title looks like a
+meeting tab (Meet/Zoom/Webex) — otherwise switching browser tabs reads as a drift.
+The nudge offers "Back to the meeting" (re-arm) or "I'm here on purpose" (mute for
+the rest of this meeting). Decision logic lives in the pure `classify`/`step`
+methods so it's unit-tested headlessly (see `run-tests.sh`). Settings → Meetings
+tab toggles it and edits the threshold/allowlist; window-title reads need
+Accessibility permission (without it the browser never counts as a drift).
 
 ## Focus Coach & Todoist
 
