@@ -47,8 +47,10 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
 
 `MeetingAttentionMonitor` nudges the user back when they drift away from a live
 meeting. "In a meeting" = mic/camera active **AND** a real meeting context: a
-current calendar event (`isInScheduledMeeting`, wired to `CalendarMonitor.isInMeeting()`)
-**or** an open Meet/Teams/Zoom call (`meetingCallOpen()`). The AND is essential —
+current calendar **video** meeting (`isInScheduledMeeting`, wired to
+`CalendarMonitor.isInVideoMeeting()` — only events with a Meet/conference link
+count, so "Lunch"/phone-appointment blocks don't) **or** an open Meet/Teams/Zoom
+call (`meetingCallOpen()`). The AND is essential —
 mic-alone is not enough because Wispr Flow dictation also holds the mic; the calendar
 / call check is what excludes dictation. The call probe checks native call apps via
 the Accessibility API (`callApps`, e.g. Zoom's "Zoom Meeting" window) and browser

@@ -708,6 +708,19 @@ final class CalendarMonitor {
         return !earlyExitMeetings.contains(meetingKey)
     }
 
+    /// Like `isInMeeting`, but only counts events that are actually video meetings
+    /// (have a Meet/conference link). The meeting-attention monitor uses this so
+    /// non-meeting calendar blocks — "Lunch", phone appointments — don't read as
+    /// meetings; combined with Wispr Flow holding the mic, they would otherwise
+    /// fire spurious drift nudges.
+    func isInVideoMeeting(at date: Date = Date()) -> Bool {
+        guard let meeting = acceptedEvents.first(where: {
+            date >= $0.start && date < $0.end && !($0.meetLink ?? "").isEmpty
+        }) else { return false }
+        let meetingKey = "\(meeting.start.timeIntervalSince1970)"
+        return !earlyExitMeetings.contains(meetingKey)
+    }
+
     private func checkAVForEarlyExit() {
         let now = Date()
         guard let meeting = acceptedEvents.first(where: { now >= $0.start && now < $0.end }) else {
@@ -2365,7 +2378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         meetingMonitor.onNudge = { [weak self] in self?.showMeetingNudge() }
-        meetingMonitor.isInScheduledMeeting = { [weak self] in self?.calendarMonitor.isInMeeting() ?? false }
+        meetingMonitor.isInScheduledMeeting = { [weak self] in self?.calendarMonitor.isInVideoMeeting() ?? false }
         meetingMonitor.start()
 
         calendarMonitor.start()
