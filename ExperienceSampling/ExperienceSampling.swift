@@ -1051,6 +1051,14 @@ final class FocusMonitor {
         return (val as? Bool) ?? true
     }
 
+    // The Claude model used for classification and coaching. Configurable in
+    // Settings → Focus; defaults to Sonnet 5.
+    static let defaultModel = "claude-sonnet-5"
+    var model: String {
+        let stored = UserDefaults.standard.string(forKey: "focusModel")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (stored?.isEmpty == false ? stored! : Self.defaultModel)
+    }
+
     // The current top Todoist to-do, re-fetched on every check.
     private var currentTopTodo: String = ""
     var onOffTaskDetected: ((String) -> Void)?
@@ -1215,7 +1223,7 @@ final class FocusMonitor {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
         var body: [String: Any] = [
-            "model": "claude-sonnet-4-6",
+            "model": model,
             "max_tokens": 300,
             "system": systemPrompt,
             "messages": messages
@@ -1412,7 +1420,7 @@ final class FocusMonitor {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
         let body: [String: Any] = [
-            "model": "claude-sonnet-4-6",
+            "model": model,
             "max_tokens": 300,
             "system": systemPrompt,
             "messages": messages
@@ -1930,6 +1938,7 @@ struct SettingsView: View {
     @AppStorage("pomodoroBreakSnooze") private var breakSnooze = 5
     @AppStorage("focusMonitorEnabled") private var focusEnabled = true
     @AppStorage("focusCheckInterval") private var focusInterval = 30
+    @AppStorage("focusModel") private var focusModel = FocusMonitor.defaultModel
     @AppStorage("meetingAttentionEnabled") private var meetingAttentionEnabled = true
     @AppStorage("meetingLingerSeconds") private var meetingLingerSeconds = 25
     @AppStorage("meetingAllowlist") private var meetingAllowlist = MeetingAttentionMonitor.defaultAllowlist
@@ -1972,6 +1981,11 @@ struct SettingsView: View {
             Form {
                 Toggle("Enable focus monitoring", isOn: $focusEnabled)
                 Stepper("Check every \(focusInterval)s", value: $focusInterval, in: 10...120, step: 10)
+                Picker("Model", selection: $focusModel) {
+                    Text("Claude Sonnet 5").tag("claude-sonnet-5")
+                    Text("Claude Opus 4.8").tag("claude-opus-4-8")
+                    Text("Claude Haiku 4.5").tag("claude-haiku-4-5")
+                }
                 HStack {
                     SecureField("Anthropic API Key", text: $apiKey)
                         .onSubmit { saveAPIKey() }

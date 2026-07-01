@@ -78,6 +78,11 @@ app persists when you reorder todos, so the two stay in sync through Todoist its
 (no direct coupling). When there is no to-do for today, the coach prompts the user
 to create one and can add it via the `create_todo` tool (`POST /api/v1/tasks`).
 
+The Claude model used for both classification and coaching is configurable in
+Settings → Focus (`focusModel` in `UserDefaults`, defaults to
+`FocusMonitor.defaultModel` = `claude-sonnet-5`). `FocusMonitor.model` reads it
+and both API calls (`callClassifyAPI`, `callAPIWithTools`) use it.
+
 ## Gotchas
 
 - **JSON date encoding/decoding must match**: When using `JSONEncoder` with `.iso8601` date strategy, the corresponding `JSONDecoder` must also use `.iso8601`. The default decoder strategy (`.deferredToDate`) expects a `Double`, not an ISO 8601 string, and `try?` silently swallows the mismatch — causing data loss on reload.
