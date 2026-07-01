@@ -1981,11 +1981,7 @@ struct SettingsView: View {
             Form {
                 Toggle("Enable focus monitoring", isOn: $focusEnabled)
                 Stepper("Check every \(focusInterval)s", value: $focusInterval, in: 10...120, step: 10)
-                Picker("Model", selection: $focusModel) {
-                    Text("Claude Sonnet 5").tag("claude-sonnet-5")
-                    Text("Claude Opus 4.8").tag("claude-opus-4-8")
-                    Text("Claude Haiku 4.5").tag("claude-haiku-4-5")
-                }
+                TextField("Model", text: $focusModel)
                 HStack {
                     SecureField("Anthropic API Key", text: $apiKey)
                         .onSubmit { saveAPIKey() }
