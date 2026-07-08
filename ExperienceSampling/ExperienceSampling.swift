@@ -946,6 +946,11 @@ struct TodoistTask {
     let dayOrder: Int
 }
 
+struct TodoistCompletedTask {
+    let content: String
+    let completedAt: Date
+}
+
 enum TopTodo {
     case todo(TodoistTask)
     case none         // token works, but no qualifying to-do for today
@@ -1008,6 +1013,47 @@ enum TodoistClient {
         }.resume()
     }
 
+    // Today's completed to-dos (most recent first). Used to tell the focus coach
+    // that time already spent on a finished to-do is a success, not a distraction —
+    // so it doesn't scold the user for e.g. an hour on Slack that *was* the
+    // (now-completed) "catch up on Slack" to-do. Failures return [] silently.
+    static func fetchCompletedTodosToday(completion: @escaping ([TodoistCompletedTask]) -> Void) {
+        guard let token = readToken() else { completion([]); return }
+
+        let startOfDay = Calendar(identifier: .gregorian).startOfDay(for: Date())
+        let stamp = ISO8601DateFormatter()
+        stamp.formatOptions = [.withInternetDateTime]
+
+        var comps = URLComponents(string: "https://api.todoist.com/api/v1/tasks/completed/by_completion_date")!
+        comps.queryItems = [
+            URLQueryItem(name: "since", value: stamp.string(from: startOfDay)),
+            URLQueryItem(name: "until", value: stamp.string(from: Date()))
+        ]
+        var request = URLRequest(url: comps.url!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data, error == nil,
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let items = json["items"] as? [[String: Any]] else {
+                completion([])
+                return
+            }
+
+            let parser = ISO8601DateFormatter()
+            parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let tasks: [TodoistCompletedTask] = items.compactMap { item in
+                guard let content = item["content"] as? String,
+                      let completedRaw = item["completed_at"] as? String,
+                      let completedAt = parser.date(from: completedRaw) else { return nil }
+                return TodoistCompletedTask(content: content, completedAt: completedAt)
+            }
+            completion(tasks.sorted { $0.completedAt > $1.completedAt })
+        }.resume()
+    }
+
     static func createTask(content: String, completion: @escaping (Bool) -> Void) {
         guard let token = readToken() else { completion(false); return }
         var request = URLRequest(url: URL(string: "https://api.todoist.com/api/v1/tasks")!)
@@ -1061,12 +1107,16 @@ final class FocusMonitor {
 
     // The current top Todoist to-do, re-fetched on every check.
     private var currentTopTodo: String = ""
+    // Today's completed to-dos, re-fetched on every check. Given to the coach so it
+    // credits time already spent on finished work instead of scolding for it.
+    private var recentlyCompletedTodos: [TodoistCompletedTask] = []
     var onOffTaskDetected: ((String) -> Void)?
     var onTopTodoChanged: ((String?) -> Void)?
 
     func start() {
         guard isEnabled else { return }
         currentTopTodo = ""
+        recentlyCompletedTodos = []
         mode = .offTask
         isShowingIntervention = false
         isChecking = false
@@ -1129,6 +1179,19 @@ final class FocusMonitor {
         return lines.joined(separator: "\n")
     }
 
+    // Formats today's completed to-dos with a rough "how long ago" so the coach can
+    // credit recently-finished work. Empty string when there are none.
+    private func completedTodosSummary() -> String {
+        guard !recentlyCompletedTodos.isEmpty else { return "" }
+        let now = Date()
+        let lines = recentlyCompletedTodos.prefix(10).map { task -> String in
+            let mins = Int(now.timeIntervalSince(task.completedAt) / 60)
+            let ago = mins < 1 ? "just now" : (mins < 60 ? "\(mins)m ago" : "\(mins / 60)h\(mins % 60)m ago")
+            return "  - \"\(task.content)\" (completed \(ago))"
+        }
+        return lines.joined(separator: "\n")
+    }
+
     private func pastSessionsSummary() -> String {
         guard !pastSessions.isEmpty else { return "" }
         var parts: [String] = []
@@ -1172,6 +1235,7 @@ final class FocusMonitor {
 
         let screenSummary = recentScreenSummary()
         let pastChats = pastSessionsSummary()
+        let completedTodos = completedTodosSummary()
 
         var systemPrompt: String
         if mode == .noTodo {
@@ -1194,6 +1258,11 @@ final class FocusMonitor {
             Recent screen activity this pomodoro:
             \(screenSummary)
             """
+        }
+
+        if !completedTodos.isEmpty {
+            systemPrompt += "\n\nTo-dos the user has already completed today (time spent on these was well " +
+                "spent — credit it, don't treat it as a distraction):\n\(completedTodos)"
         }
 
         if !pastChats.isEmpty {
@@ -1313,7 +1382,11 @@ final class FocusMonitor {
             case .todo(let todo):
                 self.currentTopTodo = todo.content
                 DispatchQueue.main.async { self.onTopTodoChanged?(todo.content) }
-                self.classify(context: context)
+                TodoistClient.fetchCompletedTodosToday { [weak self] completed in
+                    guard let self else { return }
+                    self.recentlyCompletedTodos = completed
+                    self.classify(context: context)
+                }
             }
         }
     }
@@ -1321,6 +1394,7 @@ final class FocusMonitor {
     private func classify(context: String) {
         let screenSummary = recentScreenSummary()
         let pastChats = pastSessionsSummary()
+        let completedTodos = completedTodosSummary()
 
         let systemPrompt = """
         You are a strict focus coach. Respond with ONLY valid JSON, no other text.
@@ -1334,6 +1408,10 @@ final class FocusMonitor {
         Recent screen activity this pomodoro:
         \(screenSummary)
         """
+
+        if !completedTodos.isEmpty {
+            userPrompt += "\n\nTo-dos the user has already completed today:\n\(completedTodos)"
+        }
 
         if !pastChats.isEmpty {
             userPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
@@ -1349,6 +1427,14 @@ final class FocusMonitor {
         \nIs this on-task? Be strict — only on-task if clearly and directly related to the stated to-do.
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
         However, if the current screen matches something the user has endorsed as relevant, consider it on-task.
+
+        Important: the recent screen history often includes time the user spent finishing a to-do they have \
+        since COMPLETED (see the completed-to-dos list). That time was well spent — it is a success, not a \
+        distraction. Judge on-task/off-task only on the CURRENT activity versus the current top to-do, and \
+        never scold the user for time or activity that lines up with a to-do they already completed \
+        (e.g. don't say "you spent 20 minutes on Slack" when a "catch up on Slack" to-do was just finished). \
+        If they just wrapped up a to-do and are momentarily still on that app, that's a natural transition, \
+        not a distraction.
 
         If off-task, write a conversational opening message (1-2 sentences) that mentions their top to-do, \
         notes what they're looking at, and asks what's going on. Be warm but direct. \
