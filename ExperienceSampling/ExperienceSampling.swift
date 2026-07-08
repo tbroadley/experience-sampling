@@ -1205,10 +1205,19 @@ final class FocusMonitor {
         return lines.joined(separator: "\n")
     }
 
+    // Wall-clock stamp (HH:mm:ss) shown next to each message so the coach can feel
+    // how much time is elapsing between turns and versus now.
+    static func clockStamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+
     private func conversationLines(_ session: [[String: Any]]) -> [String] {
         var lines: [String] = []
         for msg in session {
             let role = msg["role"] as? String ?? "?"
+            let stamp = (msg["ts"] as? Date).map { "[\(Self.clockStamp($0))] " } ?? ""
             if role == "assistant" {
                 let text: String
                 if let content = msg["content"] as? [[String: Any]] {
@@ -1216,10 +1225,10 @@ final class FocusMonitor {
                 } else if let content = msg["content"] as? String {
                     text = content
                 } else { continue }
-                if !text.isEmpty { lines.append("  Coach: \(text)") }
+                if !text.isEmpty { lines.append("  \(stamp)Coach: \(text)") }
             } else if role == "user" {
                 if let content = msg["content"] as? String {
-                    lines.append("  User: \(content)")
+                    lines.append("  \(stamp)User: \(content)")
                 }
             }
         }
@@ -1267,7 +1276,7 @@ final class FocusMonitor {
 
     func sendMessage(userText: String, completion: @escaping (String) -> Void) {
         isRespondingToUser = true
-        conversationHistory.append(["role": "user", "content": userText])
+        conversationHistory.append(["role": "user", "content": userText, "ts": Date()])
 
         let screenSummary = recentScreenSummary()
         let pastChats = pastSessionsSummary()
@@ -1296,6 +1305,9 @@ final class FocusMonitor {
             """
         }
 
+        systemPrompt += "\n\nCurrent time: \(Self.clockStamp(Date())). Each message below is prefixed with the " +
+            "time it was sent, so you can tell how long the user has been lingering and how long since you last spoke."
+
         let timeLeft = timeRemainingText()
         if !timeLeft.isEmpty {
             systemPrompt += "\n\nTime left in this pomodoro: \(timeLeft). Only reference how much time is " +
@@ -1323,7 +1335,7 @@ final class FocusMonitor {
                 completion("Sorry — I couldn't reach the coach just now. Try again in a moment.")
                 return
             }
-            self.conversationHistory.append(["role": "assistant", "content": response])
+            self.conversationHistory.append(["role": "assistant", "content": response, "ts": Date()])
             let text = (response as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? (response as? String) ?? ""
             completion(text)
         }
@@ -1338,11 +1350,23 @@ final class FocusMonitor {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
+        // The Anthropic API rejects unknown keys on messages, so drop our internal
+        // `ts` before sending; fold the timestamp into the text so the coach still
+        // sees when each turn happened.
+        let apiMessages: [[String: Any]] = messages.map { msg in
+            var out = msg
+            out.removeValue(forKey: "ts")
+            if let ts = msg["ts"] as? Date, let content = msg["content"] as? String {
+                out["content"] = "[\(Self.clockStamp(ts))] \(content)"
+            }
+            return out
+        }
+
         var body: [String: Any] = [
             "model": model,
             "max_tokens": 300,
             "system": systemPrompt,
-            "messages": messages
+            "messages": apiMessages
         ]
         if !tools.isEmpty { body["tools"] = tools }
 
@@ -1366,10 +1390,10 @@ final class FocusMonitor {
                 let continueWith: (String) -> Void = { [weak self] toolResult in
                     guard let self else { return }
                     var updatedMessages = messages
-                    updatedMessages.append(["role": "assistant", "content": content])
+                    updatedMessages.append(["role": "assistant", "content": content, "ts": Date()])
                     updatedMessages.append(["role": "user", "content": [
                         ["type": "tool_result", "tool_use_id": toolId, "content": toolResult]
-                    ]])
+                    ], "ts": Date()])
                     self.conversationHistory = updatedMessages
                     self.callAPIWithTools(systemPrompt: systemPrompt, messages: updatedMessages, tools: tools, completion: completion)
                 }
@@ -1448,6 +1472,7 @@ final class FocusMonitor {
         let timeLine = timeLeft.isEmpty ? "" : "\nTime left in this pomodoro: \(timeLeft)"
         var userPrompt = """
         The user is in a pomodoro. Their top to-do: "\(currentTopTodo)"
+        Current time: \(Self.clockStamp(Date()))
         They are currently in: \(context)\(timeLine)
 
         Recent screen activity this pomodoro:
@@ -1491,10 +1516,13 @@ final class FocusMonitor {
             userPrompt += """
 
 
-            The coach modal is ALREADY open and the user is still off-task. If they are still off-task, \
-            write a SHORT follow-up nudge (1 sentence) that builds on the conversation above — reference what \
-            they're doing now and gently steer them back. Do NOT repeat what you've already said; if you've \
-            made the same point before, take a slightly different angle. If they are now on-task, message can be empty.
+            The coach modal is ALREADY open. Look at what they're doing NOW. You do NOT have to send a \
+            message every check — staying quiet is a valid choice. Leave the message empty (and set on_task \
+            accordingly) if any of these are true: they've returned to their to-do or something they've \
+            endorsed; they seem on-task; or you've already made your point and another nudge would just be \
+            nagging. Only if they're still clearly off-task AND a fresh nudge would genuinely help, write a \
+            SHORT follow-up (1 sentence) that builds on the conversation above — reference what they're doing \
+            now and gently steer them back, and don't repeat a point you've already made (take a different angle).
             """
         } else {
             userPrompt += """
@@ -1546,11 +1574,11 @@ final class FocusMonitor {
                 // a second window. Skip if the user started a reply while this check
                 // was in flight, so the follow-up doesn't jump ahead of their answer.
                 guard !self.isRespondingToUser else { return }
-                self.conversationHistory.append(["role": "assistant", "content": message])
+                self.conversationHistory.append(["role": "assistant", "content": message, "ts": Date()])
                 DispatchQueue.main.async { self.onFollowUpMessage?(message) }
             } else {
                 self.isShowingIntervention = true
-                self.conversationHistory = [["role": "assistant", "content": message]]
+                self.conversationHistory = [["role": "assistant", "content": message, "ts": Date()]]
                 DispatchQueue.main.async { self.onOffTaskDetected?(message) }
             }
         }
@@ -1565,7 +1593,7 @@ final class FocusMonitor {
         mode = .noTodo
         isShowingIntervention = true
         let message = "You don't have a to-do set for today yet. What's the most important thing you want to get done right now? Tell me and I'll add it to your list."
-        conversationHistory = [["role": "assistant", "content": message]]
+        conversationHistory = [["role": "assistant", "content": message, "ts": Date()]]
         logCheck(context: lastDetectedContext, onTask: false, message: message)
         DispatchQueue.main.async { self.onOffTaskDetected?(message) }
     }
