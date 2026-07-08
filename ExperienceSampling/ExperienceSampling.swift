@@ -410,6 +410,23 @@ final class PomodoroScheduler: ObservableObject {
         onTimerTick?(0, .idle)
     }
 
+    /// Finalize a completed work session that won't be followed by a break — e.g.
+    /// a meeting or lunch is starting, so we skip the break entirely. When the
+    /// work timer hits zero the scheduler fires `onWorkSessionEnd` but leaves
+    /// `phase == .work` (the break modal normally moves it forward); this returns
+    /// it cleanly to idle. Unlike `abandon`, it does not record the session as
+    /// incomplete — it was already recorded `completed` when the timer expired.
+    func endToIdle() {
+        phase = .idle
+        stopDisplayTimer()
+        snoozeTimer?.invalidate()
+        snoozeTimer = nil
+        breakSnoozeTimer?.invalidate()
+        breakSnoozeTimer = nil
+        clearSavedState()
+        onTimerTick?(0, .idle)
+    }
+
     func scheduleSnooze() {
         snoozeTimer?.invalidate()
         snoozeTimer = Timer.scheduledTimer(withTimeInterval: Double(snoozeDuration * 60), repeats: false) { [weak self] _ in
@@ -823,6 +840,24 @@ final class CalendarMonitor {
 
     func currentMeetingEnd(at date: Date = Date()) -> Date? {
         acceptedEvents.first { date >= $0.start && date < $0.end }?.end
+    }
+
+    /// The event we're currently in, or the next one starting within `minutes`.
+    /// Used at pomodoro end to decide whether a break should be offered: a video
+    /// meeting (has a meet link) means stay silent, a non-video block ("Lunch")
+    /// means show a notice. `acceptedEvents` already excludes non-`default`
+    /// event types (focusTime, working-location), so those never count.
+    func currentOrImminentEvent(within minutes: Int, from date: Date = Date()) -> CalendarEvent? {
+        if let current = acceptedEvents.first(where: {
+            date >= $0.start && date < $0.end
+            && !earlyExitMeetings.contains("\($0.start.timeIntervalSince1970)")
+        }) {
+            return current
+        }
+        let horizon = date.addingTimeInterval(Double(minutes) * 60)
+        return acceptedEvents
+            .filter { $0.start > date && $0.start <= horizon }
+            .min { $0.start < $1.start }
     }
 
     func refresh() {
@@ -2343,7 +2378,7 @@ struct PomodoroNextView: View {
             Text("Break's Over!").font(.title2).fontWeight(.semibold)
             Text("Ready for another Pomodoro?")
             if let mins = workMinutes {
-                Text("\(mins) min (meeting coming up)")
+                Text("\(mins) min (short session)")
                     .font(.caption).foregroundColor(.orange)
             }
             HStack(spacing: 12) {
@@ -2362,6 +2397,26 @@ struct PomodoroNextView: View {
             NSApp.activate(ignoringOtherApps: true)
             focus = .startNext
         }
+    }
+}
+
+/// Informational notice shown when a pomodoro ends into a non-video calendar
+/// block (e.g. "Lunch"). Unlike the break/next prompts it offers no break or
+/// snooze — it just tells the user what's starting and dismisses.
+struct EventNoticeView: View {
+    let title: String
+    var onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Time for \(title)").font(.title2).fontWeight(.semibold)
+            Button("OK") { onDismiss() }
+                .keyboardShortcut(.return, modifiers: [])
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(24)
+        .frame(width: 300)
+        .onAppear { NSApp.activate(ignoringOtherApps: true) }
     }
 }
 
@@ -2517,14 +2572,15 @@ struct PomodoroHistoryView: View {
 /// Window delegate that runs `onClose` whenever the prompt window closes, for
 /// any reason. `windowWillClose` fires on *every* close — the user clicking the
 /// native X button, the SwiftUI view setting `isPresented = false`, and
-/// programmatic `close()` (e.g. when another prompt's `showWindow` replaces this
-/// window). So `onClose` is the single hook for snooze/cleanup that must run no
-/// matter how the window was dismissed; callers that only want to act on some
-/// closes (e.g. snooze unless the user committed an action) gate inside `onClose`.
+/// programmatic `close()`. Modals now *stack* rather than replace each other
+/// (see `showWindow`/`handleModalClosed`), so a new prompt no longer closes the
+/// one beneath it; `onClose` therefore fires only on a genuine dismissal of
+/// *this* modal. Callers that only want to act on some closes (e.g. snooze
+/// unless the user committed an action) gate inside `onClose`.
 ///
 /// Note: this app is LSUIElement with no standard menu bar, so Cmd+W is not
 /// routed to `performClose:` and does not close these windows — only the X
-/// button and programmatic replacement do.
+/// button and explicit button actions do.
 private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
     let onClose: () -> Void
     init(onClose: @escaping () -> Void) { self.onClose = onClose }
@@ -2535,8 +2591,11 @@ private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var promptWindow: NSWindow?
-    private var promptWindowDelegate: PromptWindowCloseDelegate?
+    // Stack of open modal windows. Pushing a new modal leaves the ones beneath
+    // alive; closing the top re-surfaces the previous one. Delegates are held in
+    // a parallel array because NSWindow.delegate is weak.
+    private var modalStack: [NSWindow] = []
+    private var modalDelegates: [PromptWindowCloseDelegate] = []
     // Live model for the open focus-coach modal, so follow-up nudges from
     // background checks can be appended to the conversation. Nil when no modal.
     private var focusChatModel: FocusChatModel?
@@ -2553,6 +2612,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // The live top Todoist to-do the focus coach is tracking, shown in the menu.
     private var topTodo: String = ""
     private var intradaySnoozeTimer: Timer?
+    // Fires the "start next pomodoro" prompt when a meeting/lunch that ended a
+    // pomodoro is itself over, so the pomodoro flow resumes after the break.
+    private var resumeTimer: Timer?
     private let snoozeDuration: TimeInterval = 5 * 60
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2578,9 +2640,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.updateMenuBarForPomodoro(seconds: seconds, phase: phase)
         }
         pomodoroScheduler.onWorkSessionEnd = { [weak self] in
-            self?.focusMonitor.stop()
-            self?.topTodo = ""
-            self?.showPomodoroBreak()
+            guard let self else { return }
+            self.focusMonitor.stop()
+            self.topTodo = ""
+            // If a calendar block is starting now, don't offer a break: a video
+            // meeting passes silently; a non-video block (e.g. "Lunch") shows a
+            // notice. Otherwise fall through to the normal break prompt.
+            if let event = self.calendarMonitor.currentOrImminentEvent(within: self.meetingBuffer + 2) {
+                if (event.meetLink ?? "").isEmpty { self.showEventNotice(title: event.summary) }
+                self.pomodoroScheduler.endToIdle()
+                self.scheduleResumeAfterEvent(end: event.end)
+            } else {
+                self.showPomodoroBreak()
+            }
         }
         pomodoroScheduler.onBreakStart = { [weak self] in self?.caffeinator.breakStarted() }
         pomodoroScheduler.onBreakEnd = { [weak self] in
@@ -2717,8 +2789,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Push a modal onto the stack. The new window appears on top; any windows
+    /// beneath stay alive and re-surface as each modal above them closes.
     private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onClose: (() -> Void)? = nil) {
-        promptWindow?.close()
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
         var styleMask: NSWindow.StyleMask = [.titled]
@@ -2729,16 +2802,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.center()
         window.level = .floating
         window.isReleasedWhenClosed = false
-        if let onClose {
-            let delegate = PromptWindowCloseDelegate(onClose: onClose)
-            promptWindowDelegate = delegate
-            window.delegate = delegate
-        } else {
-            promptWindowDelegate = nil
-        }
-        promptWindow = window
+        // The delegate always cleans up the stack, then runs the caller's hook.
+        let delegate = PromptWindowCloseDelegate(onClose: { [weak self, weak window] in
+            if let window { self?.handleModalClosed(window) }
+            onClose?()
+        })
+        window.delegate = delegate
+        modalStack.append(window)
+        modalDelegates.append(delegate)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Remove a just-closed modal from the stack and bring the new top forward.
+    private func handleModalClosed(_ window: NSWindow) {
+        if let i = modalStack.firstIndex(of: window) {
+            modalStack.remove(at: i)
+            modalDelegates.remove(at: i)
+        }
+        if let top = modalStack.last {
+            top.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Close the top modal. A modal only receives clicks/key shortcuts while it
+    /// is the top (windows beneath are ordered back and non-key), so "close the
+    /// top" is always "close the one the user is acting on".
+    private func closeTopModal() {
+        modalStack.last?.close()
     }
 
     private let minPomodoroDuration = 10
@@ -2766,11 +2858,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         action()
     }
 
+    // Minutes until the configured end of the workday (Settings → working hours).
+    // Google Calendar doesn't expose working-hours time ranges via its API, so we
+    // use the app's own setting to keep pomodoros from running past quitting time.
+    private func minutesUntilEndOfWorkday(from date: Date = Date()) -> Int {
+        let cal = Calendar.current
+        guard let end = cal.date(bySettingHour: scheduler.workingHoursEnd, minute: 0, second: 0, of: date) else { return .max }
+        return Int(end.timeIntervalSince(date) / 60)
+    }
+
+    // Whether there's enough of the workday left to be worth auto-starting a
+    // pomodoro. The automatic flow (post-break) stops once this is false.
+    private func workdayHasRoom() -> Bool {
+        minutesUntilEndOfWorkday() >= minPomodoroDuration
+    }
+
+    // Work minutes for the next pomodoro, capped so it ends by the next meeting
+    // and by the end of the workday — pomodoros never run past quitting time.
+    // The workday cap only applies while at least a minPomodoroDuration slice of
+    // the day is left; once it's after hours (or under that slice), the cap is
+    // skipped so an explicit start still runs a full pomodoro when working late.
     private func availableWorkMinutes() -> Int {
-        let defaultDuration = pomodoroScheduler.workDuration
-        guard let minsUntil = calendarMonitor.minutesUntilNextMeeting() else { return defaultDuration }
-        let capped = minsUntil - meetingBuffer
-        return capped < defaultDuration ? max(capped, minPomodoroDuration) : defaultDuration
+        var cap = pomodoroScheduler.workDuration
+        if let minsUntil = calendarMonitor.minutesUntilNextMeeting() {
+            cap = min(cap, max(minsUntil - meetingBuffer, minPomodoroDuration))
+        }
+        let left = minutesUntilEndOfWorkday()
+        if left >= minPomodoroDuration { cap = min(cap, left) }
+        return cap
     }
 
     @objc private func showPomodoroStartOfDay() {
@@ -2781,7 +2896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 committed = true
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
                 self?.wakeDetector.markPomodoroPrompted()
-                self?.promptWindow?.close()
+                self?.closeTopModal()
                 self?.startPomodoroNow()
             },
             onSnooze: { [weak self] excitement in
@@ -2789,13 +2904,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DataStore.shared.add(Response(timestamp: Date(), type: .startOfDay, excitement: excitement))
                 self?.wakeDetector.markPomodoroPrompted()
                 self?.pomodoroScheduler.scheduleSnooze()
-                self?.promptWindow?.close()
+                self?.closeTopModal()
             }
         )
-        // If closed without an answer (e.g. another prompt's showWindow replaces
-        // it), don't lose the day's flow: schedule a snooze so the task-input
-        // prompt reappears. No response is recorded and the day stays un-marked,
-        // so the start-of-day prompt can still show again on the next wake.
+        // If closed without an answer (e.g. the native X button), don't lose the
+        // day's flow: schedule a snooze so the task-input prompt reappears. No
+        // response is recorded and the day stays un-marked, so the start-of-day
+        // prompt can still show again on the next wake.
         showWindow(view, allowClose: false, onClose: { [weak self] in
             if !committed { self?.pomodoroScheduler.scheduleSnooze() }
         })
@@ -2819,9 +2934,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Prompt to start the next pomodoro (or snooze) once a break — or a snooze
     /// — ends. Used for automatic triggers where we don't auto-start work: the
     /// modal waits for the user, so the next pomodoro never ticks down while
-    /// they're away from the machine. Defers around meetings.
+    /// they're away from the machine. Defers around meetings, and stops entirely
+    /// once the workday is over so it doesn't keep prompting after hours.
     private func showPomodoroNext() {
         guard pomodoroScheduler.phase == .idle else { return }
+        guard workdayHasRoom() else { return }
         deferIfMeeting { [weak self] in
             guard let self else { return }
             let workMins = self.availableWorkMinutes()
@@ -2830,7 +2947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var committed = false
             let view = PomodoroNextView(
                 isPresented: Binding(get: { presented }, set: { [weak self] v in
-                    presented = v; if !v { self?.promptWindow?.close() }
+                    presented = v; if !v { self?.closeTopModal() }
                 }),
                 snoozeDuration: self.pomodoroScheduler.snoozeDuration,
                 workMinutes: workMins < defaultDuration ? workMins : nil,
@@ -2842,8 +2959,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleSnooze() }
             )
             // Snooze on any close that isn't an explicit Start/Snooze — covers
-            // the native X and programmatic replacement by another prompt's
-            // showWindow, so the prompt is never silently lost.
+            // the native X button, so the prompt is never silently lost.
             self.showWindow(view, onClose: { [weak self] in
                 if !committed { self?.pomodoroScheduler.scheduleSnooze() }
             })
@@ -2857,7 +2973,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var committed = false
         let view = PomodoroBreakView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
-                presented = v; if !v { self?.promptWindow?.close() }
+                presented = v; if !v { self?.closeTopModal() }
             }),
             isLongBreak: isLong,
             breakDuration: duration,
@@ -2870,10 +2986,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
     }
 
+    // After a pomodoro ends into a meeting/lunch, prompt to start the next one
+    // when that event is over (plus a small buffer). showPomodoroNext already
+    // guards on being idle, having workday room left, and defers around any
+    // back-to-back meeting — so a stale timer or a late meeting can't misfire.
+    private func scheduleResumeAfterEvent(end: Date) {
+        resumeTimer?.invalidate()
+        let delay = end.timeIntervalSinceNow + 30
+        guard delay > 0 else { showPomodoroNext(); return }
+        resumeTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            self?.showPomodoroNext()
+        }
+    }
+
+    // Informational notice shown when a pomodoro ends into a non-video calendar
+    // block (e.g. "Lunch"). No break is offered; the user just acknowledges it.
+    private func showEventNotice(title: String) {
+        let view = EventNoticeView(title: title, onDismiss: { [weak self] in self?.closeTopModal() })
+        showWindow(view)
+    }
+
+    // Start the pending break immediately. Used from the menu after the user has
+    // snoozed a break and is now ready — no confirmation modal, since asking to
+    // start the break is itself the confirmation.
     @objc private func takeBreakNow() {
         pomodoroScheduler.cancelBreakSnooze()
-        promptWindow?.close()
-        showPomodoroBreak()
+        pomodoroScheduler.startBreak(isLong: pomodoroScheduler.isLongBreakDue())
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -2883,6 +3021,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func abandonPomodoro() {
         focusMonitor.stop()
         topTodo = ""
+        resumeTimer?.invalidate()
+        resumeTimer = nil
         pomodoroScheduler.abandon()
         caffeinator.sessionEnded()
     }
@@ -2893,7 +3033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         focusChatModel = model
         let view = FocusInterventionView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
-                presented = v; if !v { self?.promptWindow?.close() }
+                presented = v; if !v { self?.closeTopModal() }
             }),
             model: model,
             onSendMessage: { [weak self] text, completion in
@@ -2907,9 +3047,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         )
         // Safety net: if this window is dismissed by any path other than its own
-        // buttons (e.g. another prompt's showWindow replaces it), reset the
-        // monitor so focus checks resume instead of stalling on a stuck
-        // isShowingIntervention flag. Idempotent with the button handlers.
+        // buttons (e.g. the native X button), reset the monitor so focus checks
+        // resume instead of stalling on a stuck isShowingIntervention flag.
+        // Idempotent with the button handlers.
         showWindow(view, allowClose: false, onClose: { [weak self] in
             self?.focusChatModel = nil
             self?.focusMonitor.resumeAfterIntervention()
@@ -2922,16 +3062,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             onBack: { [weak self] in
                 committed = true
                 self?.meetingMonitor.dismissNudge()
-                self?.promptWindow?.close()
+                self?.closeTopModal()
             },
             onSnooze: { [weak self] in
                 committed = true
                 self?.meetingMonitor.snoozeForMeeting()
-                self?.promptWindow?.close()
+                self?.closeTopModal()
             }
         )
-        // Any other close path (native X, or another prompt's showWindow replacing
-        // this one) re-arms the monitor rather than leaving it stuck showing.
+        // Any other close path (the native X button) re-arms the monitor rather
+        // than leaving it stuck showing.
         showWindow(view, onClose: { [weak self] in
             if !committed { self?.meetingMonitor.dismissNudge() }
         })
@@ -2951,7 +3091,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let view = IntradayView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
-                presented = v; if !v { self?.promptWindow?.close() }
+                presented = v; if !v { self?.closeTopModal() }
             }),
             onSubmit: { activity, excitement in
                 committed = true
