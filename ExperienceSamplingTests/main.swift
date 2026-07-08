@@ -208,6 +208,18 @@ do {
     checkEqual(long.timeRemaining, 15 * 60, "long break = longBreakDuration(15) * 60")
 }
 
+section("endToIdle: returns to idle and clears saved state (no break follows)")
+do {
+    clearSaved()
+    let s = PomodoroScheduler()
+    s.startWork()
+    checkEqual(s.phase, .work, "work started")
+    check(UserDefaults.standard.string(forKey: kPhase) != nil, "state saved while working")
+    s.endToIdle()
+    checkEqual(s.phase, .idle, "phase is idle after endToIdle")
+    check(UserDefaults.standard.string(forKey: kPhase) == nil, "saved state cleared after endToIdle")
+}
+
 section("onBreakStart fires when a break starts (drives caffeination)")
 do {
     clearSaved()
