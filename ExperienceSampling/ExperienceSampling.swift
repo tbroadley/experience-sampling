@@ -1111,7 +1111,17 @@ final class FocusMonitor {
     // credits time already spent on finished work instead of scolding for it.
     private var recentlyCompletedTodos: [TodoistCompletedTask] = []
     var onOffTaskDetected: ((String) -> Void)?
+    // Fired when a check finds the user still off-task while the coach modal is
+    // already open, so the coach can append a fresh nudge to the live conversation.
+    var onFollowUpMessage: ((String) -> Void)?
     var onTopTodoChanged: ((String?) -> Void)?
+    // Seconds left in the current work pomodoro, or nil if not in a work phase.
+    // Wired to PomodoroScheduler so the coach knows how much time remains.
+    var workTimeRemaining: (() -> Int?)?
+
+    // True while a user-sent message is being answered, so background focus checks
+    // don't append a follow-up on top of the reply the user is waiting for.
+    private var isRespondingToUser = false
 
     func start() {
         guard isEnabled else { return }
@@ -1120,6 +1130,7 @@ final class FocusMonitor {
         mode = .offTask
         isShowingIntervention = false
         isChecking = false
+        isRespondingToUser = false
         conversationHistory = []
         pastSessions = []
         screenHistory = []
@@ -1137,6 +1148,7 @@ final class FocusMonitor {
 
     func resumeAfterIntervention() {
         isShowingIntervention = false
+        isRespondingToUser = false
         if !conversationHistory.isEmpty {
             pastSessions.append(conversationHistory)
         }
@@ -1148,6 +1160,7 @@ final class FocusMonitor {
             endorsedContexts.append(lastDetectedContext)
         }
         isShowingIntervention = false
+        isRespondingToUser = false
         conversationHistory = []
     }
 
@@ -1192,32 +1205,54 @@ final class FocusMonitor {
         return lines.joined(separator: "\n")
     }
 
+    private func conversationLines(_ session: [[String: Any]]) -> [String] {
+        var lines: [String] = []
+        for msg in session {
+            let role = msg["role"] as? String ?? "?"
+            if role == "assistant" {
+                let text: String
+                if let content = msg["content"] as? [[String: Any]] {
+                    text = content.compactMap { $0["text"] as? String }.joined()
+                } else if let content = msg["content"] as? String {
+                    text = content
+                } else { continue }
+                if !text.isEmpty { lines.append("  Coach: \(text)") }
+            } else if role == "user" {
+                if let content = msg["content"] as? String {
+                    lines.append("  User: \(content)")
+                }
+            }
+        }
+        return lines
+    }
+
     private func pastSessionsSummary() -> String {
         guard !pastSessions.isEmpty else { return "" }
         var parts: [String] = []
         for (i, session) in pastSessions.enumerated() {
-            var lines: [String] = []
-            for msg in session {
-                let role = msg["role"] as? String ?? "?"
-                if role == "assistant" {
-                    let text: String
-                    if let content = msg["content"] as? [[String: Any]] {
-                        text = content.compactMap { $0["text"] as? String }.joined()
-                    } else if let content = msg["content"] as? String {
-                        text = content
-                    } else { continue }
-                    if !text.isEmpty { lines.append("  Coach: \(text)") }
-                } else if role == "user" {
-                    if let content = msg["content"] as? String {
-                        lines.append("  User: \(content)")
-                    }
-                }
-            }
+            let lines = conversationLines(session)
             if !lines.isEmpty {
                 parts.append("Session \(i + 1):\n\(lines.joined(separator: "\n"))")
             }
         }
         return parts.joined(separator: "\n")
+    }
+
+    // The coaching exchange in the currently-open modal, for follow-up checks so the
+    // coach can see what it has already said and not repeat itself.
+    private func currentConversationSummary() -> String {
+        conversationLines(conversationHistory).joined(separator: "\n")
+    }
+
+    // Human-readable time left in the current pomodoro, e.g. "20 min 30 sec".
+    // Empty when we can't tell (not in a work phase).
+    private func timeRemainingText() -> String {
+        guard let seconds = workTimeRemaining?(), seconds > 0 else { return "" }
+        let mins = seconds / 60
+        let secs = seconds % 60
+        if mins == 0 { return "\(secs) sec" }
+        if secs == 0 { return "\(mins) min" }
+        return "\(mins) min \(secs) sec"
     }
 
     private var conversationTools: [[String: Any]] {
@@ -1231,6 +1266,7 @@ final class FocusMonitor {
     }
 
     func sendMessage(userText: String, completion: @escaping (String) -> Void) {
+        isRespondingToUser = true
         conversationHistory.append(["role": "user", "content": userText])
 
         let screenSummary = recentScreenSummary()
@@ -1260,6 +1296,12 @@ final class FocusMonitor {
             """
         }
 
+        let timeLeft = timeRemainingText()
+        if !timeLeft.isEmpty {
+            systemPrompt += "\n\nTime left in this pomodoro: \(timeLeft). Only reference how much time is " +
+                "left if it's accurate — don't claim the session is nearly over when it isn't."
+        }
+
         if !completedTodos.isEmpty {
             systemPrompt += "\n\nTo-dos the user has already completed today (time spent on these was well " +
                 "spent — credit it, don't treat it as a distraction):\n\(completedTodos)"
@@ -1275,7 +1317,12 @@ final class FocusMonitor {
         }
 
         callAPIWithTools(systemPrompt: systemPrompt, messages: conversationHistory, tools: conversationTools) { [weak self] response in
-            guard let self, let response else { return }
+            guard let self else { return }
+            self.isRespondingToUser = false
+            guard let response else {
+                completion("Sorry — I couldn't reach the coach just now. Try again in a moment.")
+                return
+            }
             self.conversationHistory.append(["role": "assistant", "content": response])
             let text = (response as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? (response as? String) ?? ""
             completion(text)
@@ -1355,7 +1402,10 @@ final class FocusMonitor {
     }
 
     private func checkFocus() {
-        guard !isShowingIntervention, !isChecking else { return }
+        // Keep checking even while the coach modal is open (so we can send follow-up
+        // nudges), but never overlap with an in-flight check or a reply the user is
+        // waiting on.
+        guard !isChecking, !isRespondingToUser else { return }
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
         let appName = frontApp.localizedName ?? "Unknown"
 
@@ -1391,29 +1441,29 @@ final class FocusMonitor {
         }
     }
 
-    private func classify(context: String) {
-        let screenSummary = recentScreenSummary()
-        let pastChats = pastSessionsSummary()
-        let completedTodos = completedTodosSummary()
-
-        let systemPrompt = """
-        You are a strict focus coach. Respond with ONLY valid JSON, no other text.
-        Format: {"on_task": true/false, "message": "string"}
-        """
-
+    // Builds the classifier user prompt. `isFollowUp` is true when the coach modal
+    // is already open, which swaps in follow-up framing and the live conversation.
+    private func classifyUserPrompt(context: String, isFollowUp: Bool) -> String {
+        let timeLeft = timeRemainingText()
+        let timeLine = timeLeft.isEmpty ? "" : "\nTime left in this pomodoro: \(timeLeft)"
         var userPrompt = """
         The user is in a pomodoro. Their top to-do: "\(currentTopTodo)"
-        They are currently in: \(context)
+        They are currently in: \(context)\(timeLine)
 
         Recent screen activity this pomodoro:
-        \(screenSummary)
+        \(recentScreenSummary())
         """
 
+        let completedTodos = completedTodosSummary()
         if !completedTodos.isEmpty {
             userPrompt += "\n\nTo-dos the user has already completed today:\n\(completedTodos)"
         }
 
-        if !pastChats.isEmpty {
+        let currentChat = currentConversationSummary()
+        let pastChats = pastSessionsSummary()
+        if isFollowUp && !currentChat.isEmpty {
+            userPrompt += "\n\nThe coach modal is already open. The conversation so far:\n\(currentChat)"
+        } else if !pastChats.isEmpty {
             userPrompt += "\n\nPrevious coaching conversations this pomodoro:\n\(pastChats)"
         }
 
@@ -1435,14 +1485,39 @@ final class FocusMonitor {
         (e.g. don't say "you spent 20 minutes on Slack" when a "catch up on Slack" to-do was just finished). \
         If they just wrapped up a to-do and are momentarily still on that app, that's a natural transition, \
         not a distraction.
-
-        If off-task, write a conversational opening message (1-2 sentences) that mentions their top to-do, \
-        notes what they're looking at, and asks what's going on. Be warm but direct. \
-        Use the screen history and past conversations for context — don't repeat yourself if you've already \
-        discussed the same distraction.
-        If on-task, message can be empty.
         """
 
+        if isFollowUp {
+            userPrompt += """
+
+
+            The coach modal is ALREADY open and the user is still off-task. If they are still off-task, \
+            write a SHORT follow-up nudge (1 sentence) that builds on the conversation above — reference what \
+            they're doing now and gently steer them back. Do NOT repeat what you've already said; if you've \
+            made the same point before, take a slightly different angle. If they are now on-task, message can be empty.
+            """
+        } else {
+            userPrompt += """
+
+
+            If off-task, write a conversational opening message (1-2 sentences) that mentions their top to-do, \
+            notes what they're looking at, and asks what's going on. Be warm but direct. \
+            Use the screen history and past conversations for context — don't repeat yourself if you've already \
+            discussed the same distraction.
+            If on-task, message can be empty.
+            """
+        }
+
+        return userPrompt
+    }
+
+    private func classify(context: String) {
+        let systemPrompt = """
+        You are a strict focus coach. Respond with ONLY valid JSON, no other text.
+        Format: {"on_task": true/false, "message": "string"}
+        """
+
+        let userPrompt = classifyUserPrompt(context: context, isFollowUp: isShowingIntervention)
         let messages: [[String: Any]] = [["role": "user", "content": userPrompt]]
 
         callClassifyAPI(systemPrompt: systemPrompt, messages: messages) { [weak self] response in
@@ -1462,12 +1537,21 @@ final class FocusMonitor {
             self.logCheck(context: context, onTask: onTask, message: message)
 
             guard !onTask else { return }
+            guard !message.isEmpty else { return }
             self.mode = .offTask
-            self.isShowingIntervention = true
-            self.conversationHistory = [["role": "assistant", "content": message]]
 
-            DispatchQueue.main.async {
-                self.onOffTaskDetected?(message)
+            if self.isShowingIntervention {
+                // The coach modal is already open and the user is still off-task —
+                // append a fresh nudge to the live conversation instead of opening
+                // a second window. Skip if the user started a reply while this check
+                // was in flight, so the follow-up doesn't jump ahead of their answer.
+                guard !self.isRespondingToUser else { return }
+                self.conversationHistory.append(["role": "assistant", "content": message])
+                DispatchQueue.main.async { self.onFollowUpMessage?(message) }
+            } else {
+                self.isShowingIntervention = true
+                self.conversationHistory = [["role": "assistant", "content": message]]
+                DispatchQueue.main.async { self.onOffTaskDetected?(message) }
             }
         }
     }
@@ -2253,16 +2337,30 @@ struct PomodoroNextView: View {
     }
 }
 
+// Holds the coach conversation so the app can push follow-up nudges into an
+// already-open modal (checks keep running while the modal is up). The view
+// observes this; the app delegate appends to it.
+final class FocusChatModel: ObservableObject {
+    @Published var messages: [ChatMessage]
+    @Published var isLoading = false
+
+    init(initialMessage: String) {
+        messages = [ChatMessage(role: .assistant, text: initialMessage)]
+    }
+
+    func appendCoachMessage(_ text: String) {
+        messages.append(ChatMessage(role: .assistant, text: text))
+    }
+}
+
 struct FocusInterventionView: View {
     @Binding var isPresented: Bool
-    let initialMessage: String
+    @ObservedObject var model: FocusChatModel
     var onSendMessage: (String, @escaping (String) -> Void) -> Void
     var onDismiss: () -> Void
     var onEndorse: () -> Void
 
-    @State private var messages: [ChatMessage] = []
     @State private var inputText: String = ""
-    @State private var isLoading = false
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -2288,7 +2386,7 @@ struct FocusInterventionView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(messages) { msg in
+                        ForEach(model.messages) { msg in
                             HStack {
                                 if msg.role == .user { Spacer(minLength: 60) }
                                 Text(msg.text)
@@ -2300,7 +2398,7 @@ struct FocusInterventionView: View {
                             }
                             .id(msg.id)
                         }
-                        if isLoading {
+                        if model.isLoading {
                             HStack {
                                 ProgressView().controlSize(.small)
                                 Text("Thinking...").foregroundColor(.secondary).font(.caption)
@@ -2311,8 +2409,8 @@ struct FocusInterventionView: View {
                     }
                     .padding(12)
                 }
-                .onChange(of: messages.count) { _, _ in
-                    if let last = messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                .onChange(of: model.messages.count) { _, _ in
+                    if let last = model.messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
                 }
             }
 
@@ -2323,16 +2421,15 @@ struct FocusInterventionView: View {
                     .textFieldStyle(.roundedBorder)
                     .focused($inputFocused)
                     .onSubmit { sendMessage() }
-                    .disabled(isLoading)
+                    .disabled(model.isLoading)
                 Button("Send") { sendMessage() }
-                    .disabled(inputText.trimmingCharacters(in: .whitespaces).isEmpty || isLoading)
+                    .disabled(inputText.trimmingCharacters(in: .whitespaces).isEmpty || model.isLoading)
             }
             .padding(12)
         }
         .frame(width: 420, height: 350)
         .onAppear {
             NSApp.activate(ignoringOtherApps: true)
-            messages = [ChatMessage(role: .assistant, text: initialMessage)]
             inputFocused = true
         }
     }
@@ -2340,13 +2437,13 @@ struct FocusInterventionView: View {
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
-        messages.append(ChatMessage(role: .user, text: text))
+        model.messages.append(ChatMessage(role: .user, text: text))
         inputText = ""
-        isLoading = true
+        model.isLoading = true
         onSendMessage(text) { response in
             DispatchQueue.main.async {
-                messages.append(ChatMessage(role: .assistant, text: response))
-                isLoading = false
+                model.messages.append(ChatMessage(role: .assistant, text: response))
+                model.isLoading = false
             }
         }
     }
@@ -2412,6 +2509,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var promptWindow: NSWindow?
     private var promptWindowDelegate: PromptWindowCloseDelegate?
+    // Live model for the open focus-coach modal, so follow-up nudges from
+    // background checks can be appended to the conversation. Nil when no modal.
+    private var focusChatModel: FocusChatModel?
     private let scheduler = PromptScheduler()
     private let wakeDetector = WakeDetector()
     private let pomodoroScheduler = PomodoroScheduler()
@@ -2468,6 +2568,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         focusMonitor.onOffTaskDetected = { [weak self] message in
             self?.showFocusIntervention(message: message)
+        }
+        focusMonitor.onFollowUpMessage = { [weak self] message in
+            self?.focusChatModel?.appendCoachMessage(message)
+        }
+        focusMonitor.workTimeRemaining = { [weak self] in
+            guard let self, self.pomodoroScheduler.phase == .work else { return nil }
+            return self.pomodoroScheduler.timeRemaining
         }
         focusMonitor.onTopTodoChanged = { [weak self] todo in
             self?.topTodo = todo ?? ""
@@ -2754,11 +2861,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showFocusIntervention(message: String) {
         var presented = true
+        let model = FocusChatModel(initialMessage: message)
+        focusChatModel = model
         let view = FocusInterventionView(
             isPresented: Binding(get: { presented }, set: { [weak self] v in
                 presented = v; if !v { self?.promptWindow?.close() }
             }),
-            initialMessage: message,
+            model: model,
             onSendMessage: { [weak self] text, completion in
                 self?.focusMonitor.sendMessage(userText: text, completion: completion)
             },
@@ -2774,6 +2883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // monitor so focus checks resume instead of stalling on a stuck
         // isShowingIntervention flag. Idempotent with the button handlers.
         showWindow(view, allowClose: false, onClose: { [weak self] in
+            self?.focusChatModel = nil
             self?.focusMonitor.resumeAfterIntervention()
         })
     }
