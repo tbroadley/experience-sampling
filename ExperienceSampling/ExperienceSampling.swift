@@ -2637,6 +2637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
+        setupMainMenu()
 
         scheduler.onPromptTriggered = { [weak self] in
             guard let self else { return }
@@ -2773,6 +2774,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
         menu.delegate = self
+    }
+
+    /// Install a standard Edit menu. This is an LSUIElement/accessory app with no
+    /// visible menu bar, so the system never sees an Edit menu — and the standard
+    /// text-editing shortcuts (Cmd+X/C/V/A) work only via that menu's key
+    /// equivalents routing through the first responder. Without it, Cmd+V never
+    /// reached our text fields (e.g. the focus coach "What's going on?" box), and
+    /// paste-based dictation like Wispr Flow silently dropped its text for the same
+    /// reason. The menu bar stays hidden (accessory apps show none); only the key
+    /// equivalents matter. Cmd, not Ctrl, is the macOS standard for these.
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        // The first submenu is treated as the application menu; its title is ignored.
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redo)
+        editMenu.addItem(.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+
+        NSApp.mainMenu = mainMenu
     }
 
     private func updateMenuBarForPomodoro(seconds: Int, phase: PomodoroPhase) {
