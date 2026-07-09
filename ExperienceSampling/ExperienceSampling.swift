@@ -2596,6 +2596,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // a parallel array because NSWindow.delegate is weak.
     private var modalStack: [NSWindow] = []
     private var modalDelegates: [PromptWindowCloseDelegate] = []
+    // True while a "Good morning" start-of-day prompt is open. Wake notifications
+    // fire twice (didWake + screensDidWake) before the user commits, which would
+    // otherwise stack a second prompt on top of the first.
+    private var startOfDayPromptOpen = false
     // Live model for the open focus-coach modal, so follow-up nudges from
     // background checks can be appended to the conversation. Nil when no modal.
     private var focusChatModel: FocusChatModel?
@@ -2889,6 +2893,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showPomodoroStartOfDay() {
+        // Guard against a second prompt stacking on top of the first: paired wake
+        // notifications can call this again before the user commits (which is what
+        // sets the "already prompted today" flag).
+        guard !startOfDayPromptOpen else { return }
+        startOfDayPromptOpen = true
         var committed = false
         let view = CombinedStartOfDayView(
             snoozeDuration: pomodoroScheduler.snoozeDuration,
@@ -2912,6 +2921,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // response is recorded and the day stays un-marked, so the start-of-day
         // prompt can still show again on the next wake.
         showWindow(view, allowClose: false, onClose: { [weak self] in
+            self?.startOfDayPromptOpen = false
             if !committed { self?.pomodoroScheduler.scheduleSnooze() }
         })
     }
