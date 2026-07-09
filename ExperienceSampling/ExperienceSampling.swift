@@ -1453,6 +1453,16 @@ final class FocusMonitor {
         }
     }
 
+    // True when the Mac is at the lock screen or the login window (screen locked, or
+    // no user session on the console — e.g. fast-user-switched away). We skip focus
+    // checks in this state since the user is away from the machine.
+    static func systemScreenLockedOrLoggedOut() -> Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+        let locked = (info["CGSSessionScreenIsLocked"] as? Int) == 1
+        let onConsole = (info["kCGSSessionOnConsoleKey"] as? Bool) ?? true
+        return locked || !onConsole
+    }
+
     private func startTimer() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: checkInterval, repeats: true) { [weak self] _ in
@@ -1465,6 +1475,10 @@ final class FocusMonitor {
         // nudges), but never overlap with an in-flight check or a reply the user is
         // waiting on.
         guard !isChecking, !isRespondingToUser else { return }
+        // Don't coach while the Mac is locked or sitting at the login window — the
+        // user has stepped away (bathroom, lunch, etc.). The frontmost "app" would
+        // just be loginwindow, which only confuses the coach.
+        if Self.systemScreenLockedOrLoggedOut() { return }
         guard let frontApp = NSWorkspace.shared.frontmostApplication else { return }
         let appName = frontApp.localizedName ?? "Unknown"
 
