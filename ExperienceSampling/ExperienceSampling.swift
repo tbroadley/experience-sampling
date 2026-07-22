@@ -2023,22 +2023,51 @@ struct MeetingNudgeView: View {
     var onSnooze: () -> Void
 
     var body: some View {
-        VStack(spacing: 20) {
-            Text("Still in a meeting?").font(.title2).fontWeight(.semibold)
-            Text("You've drifted away from the meeting for a bit. Head back, or let me know you're away on purpose and I'll stay quiet for the rest of this meeting.")
-                .multilineTextAlignment(.center)
-                .foregroundColor(.secondary)
+        VStack(spacing: 22) {
+            Text("Zoning out?").font(.system(size: 30, weight: .bold))
+            VStack(spacing: 14) {
+                NudgeTip(icon: "waveform", tint: .orange, text: "Bad audio or video? Fix it now.")
+                NudgeTip(icon: "questionmark.bubble.fill", tint: .blue, text: "Lost the thread? Ask a question.")
+                NudgeTip(icon: "rectangle.portrait.and.arrow.right", tint: .purple, text: "Not worth it? Just leave.")
+            }
             HStack(spacing: 12) {
-                Button("I'm here on purpose") { onSnooze() }
+                Button("Away on purpose") { onSnooze() }
                     .keyboardShortcut(.escape, modifiers: [])
-                Button("Back to the meeting") { onBack() }
+                Button("Back to it") { onBack() }
                     .keyboardShortcut(.return, modifiers: [])
                     .buttonStyle(.borderedProminent)
             }
+            .controlSize(.large)
         }
-        .padding(24)
-        .frame(width: 360)
-        .onAppear { NSApp.activate(ignoringOtherApps: true) }
+        .padding(28)
+        .frame(width: 420)
+    }
+}
+
+/// One high-contrast prompt row in the meeting-drift nudge: a colored icon
+/// chip and a short, bold instruction.
+private struct NudgeTip: View {
+    var icon: String
+    var tint: Color
+    var text: String
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(width: 48, height: 48)
+                .background(tint, in: RoundedRectangle(cornerRadius: 12))
+            Text(text)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity)
+        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
     }
 }
 
@@ -2766,6 +2795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let debug = NSMenu()
         debug.addItem(NSMenuItem(title: "Show Pomodoro Start", action: #selector(showPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
+        debug.addItem(NSMenuItem(title: "Show Meeting Nudge", action: #selector(debugShowMeetingNudge), keyEquivalent: ""))
         let debugItem = NSMenuItem(title: "Debug", action: nil, keyEquivalent: "")
         debugItem.submenu = debug
         menu.addItem(debugItem)
@@ -3115,6 +3145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.focusMonitor.resumeAfterIntervention()
         })
     }
+
+    @objc private func debugShowMeetingNudge() { showMeetingNudge() }
 
     private func showMeetingNudge() {
         var committed = false
