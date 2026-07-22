@@ -971,6 +971,11 @@ struct ChatMessage: Identifiable {
 struct ScreenObservation {
     let timestamp: Date
     let context: String
+    // The top to-do that was active when this screen was observed. Lets the coach
+    // judge past activity against the to-do that was live THEN, not the current one,
+    // so time spent on Slack while "catch up on Slack" was the top to-do doesn't get
+    // scolded once the top to-do rolls over to something else.
+    let topTodo: String
 }
 
 // MARK: - Todoist
@@ -1199,30 +1204,40 @@ final class FocusMonitor {
         conversationHistory = []
     }
 
-    private func recordScreen(_ context: String) {
-        screenHistory.append(ScreenObservation(timestamp: Date(), context: context))
+    private func recordScreen(_ context: String, topTodo: String) {
+        screenHistory.append(ScreenObservation(timestamp: Date(), context: context, topTodo: topTodo))
     }
 
     private func recentScreenSummary() -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
 
-        let start = screenHistory.startIndex
-        let recent = screenHistory[start...]
-
-        var runs: [(context: String, from: Date, to: Date)] = []
-        for obs in recent {
-            if let last = runs.last, last.context == obs.context {
-                runs[runs.count - 1] = (last.context, last.from, obs.timestamp)
+        // Collapse consecutive observations that share BOTH the context and the
+        // top to-do into a single run. Splitting on the to-do too means a stretch of
+        // "Slack" gets broken in half at the moment the top to-do rolled over, which
+        // is exactly the transition the coach needs to see.
+        var runs: [(context: String, todo: String, from: Date, to: Date)] = []
+        for obs in screenHistory {
+            if let last = runs.last, last.context == obs.context, last.todo == obs.topTodo {
+                runs[runs.count - 1] = (last.context, last.todo, last.from, obs.timestamp)
             } else {
-                runs.append((obs.context, obs.timestamp, obs.timestamp))
+                runs.append((obs.context, obs.topTodo, obs.timestamp, obs.timestamp))
             }
         }
 
-        let lines = runs.suffix(15).map { run in
+        // Emit a "top to-do:" header whenever the active to-do changes, so the
+        // timeline reads as blocks of activity under the to-do that was live then.
+        var lines: [String] = []
+        var lastTodo: String?
+        for run in runs.suffix(15) {
+            if run.todo != lastTodo {
+                lines.append(run.todo.isEmpty ? "  — top to-do at this point: (none set)"
+                                             : "  — top to-do at this point: \"\(run.todo)\"")
+                lastTodo = run.todo
+            }
             let duration = Int(run.to.timeIntervalSince(run.from))
             let durStr = duration > 0 ? " (\(duration)s)" : ""
-            return "  \(formatter.string(from: run.from))\(durStr) — \(run.context)"
+            lines.append("      \(formatter.string(from: run.from))\(durStr) — \(run.context)")
         }
         return lines.joined(separator: "\n")
     }
@@ -1487,7 +1502,6 @@ final class FocusMonitor {
         let windowTitle = getWindowTitle(pid: frontApp.processIdentifier)
         let context = "\(appName)\(windowTitle.map { " — \($0)" } ?? "")"
 
-        recordScreen(context)
         lastDetectedContext = context
         isChecking = true
 
@@ -1495,15 +1509,19 @@ final class FocusMonitor {
             guard let self else { return }
             switch result {
             case .unavailable:
-                // No token or the fetch failed — skip this check silently.
+                // No token or the fetch failed — keep the last known to-do so the
+                // timeline stays continuous, then skip this check silently.
+                self.recordScreen(context, topTodo: self.currentTopTodo)
                 self.isChecking = false
             case .none:
-                self.isChecking = false
                 self.currentTopTodo = ""
+                self.recordScreen(context, topTodo: "")
+                self.isChecking = false
                 DispatchQueue.main.async { self.onTopTodoChanged?(nil) }
                 self.maybePromptCreateTodo()
             case .todo(let todo):
                 self.currentTopTodo = todo.content
+                self.recordScreen(context, topTodo: todo.content)
                 DispatchQueue.main.async { self.onTopTodoChanged?(todo.content) }
                 TodoistClient.fetchCompletedTodosToday { [weak self] completed in
                     guard let self else { return }
@@ -1552,13 +1570,16 @@ final class FocusMonitor {
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
         However, if the current screen matches something the user has endorsed as relevant, consider it on-task.
 
-        Important: the recent screen history often includes time the user spent finishing a to-do they have \
-        since COMPLETED (see the completed-to-dos list). That time was well spent — it is a success, not a \
-        distraction. Judge on-task/off-task only on the CURRENT activity versus the current top to-do, and \
-        never scold the user for time or activity that lines up with a to-do they already completed \
-        (e.g. don't say "you spent 20 minutes on Slack" when a "catch up on Slack" to-do was just finished). \
-        If they just wrapped up a to-do and are momentarily still on that app, that's a natural transition, \
-        not a distraction.
+        Important: the screen-activity timeline is annotated with the top to-do that was active at each \
+        point ("top to-do at this point: ..."). The top to-do can change during a single pomodoro as the \
+        user finishes tasks and rolls onto the next. Judge each block of past activity against the to-do that \
+        was active AT THAT TIME, not the current one. Time on Slack while "catch up on Slack" was the top \
+        to-do was on-task and well spent — do NOT hold it against the user now that the top to-do has moved \
+        on to something else. Only the CURRENT activity should be judged against the CURRENT top to-do. \
+        Never say things like "you've been bouncing around Slack and email the whole session" when that time \
+        lines up with an earlier top to-do (or a to-do they have since completed — see the completed-to-dos \
+        list). If they just wrapped up a to-do and are momentarily still on that app, that's a natural \
+        transition, not a distraction.
         """
 
         if isFollowUp {
@@ -2397,7 +2418,6 @@ struct PomodoroBreakView: View {
         .padding(24)
         .frame(width: 300)
         .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
             focus = .start
         }
     }
@@ -2437,7 +2457,6 @@ struct PomodoroNextView: View {
         .padding(24)
         .frame(width: 320)
         .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
             focus = .startNext
         }
     }
@@ -2459,7 +2478,6 @@ struct EventNoticeView: View {
         }
         .padding(24)
         .frame(width: 300)
-        .onAppear { NSApp.activate(ignoringOtherApps: true) }
     }
 }
 
@@ -2555,7 +2573,6 @@ struct FocusInterventionView: View {
         }
         .frame(width: 420, height: 350)
         .onAppear {
-            NSApp.activate(ignoringOtherApps: true)
             inputFocused = true
         }
     }
@@ -2639,6 +2656,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // a parallel array because NSWindow.delegate is weak.
     private var modalStack: [NSWindow] = []
     private var modalDelegates: [PromptWindowCloseDelegate] = []
+    // Whether each stacked window should steal keyboard focus (activate the app
+    // and become key) when it surfaces. Parallel to `modalStack`. Only the
+    // start-of-day and random intraday check-ins steal focus; everything else
+    // (coach, pomodoro/break prompts, notices) surfaces without grabbing focus.
+    private var modalStealFocus: [Bool] = []
     // True while a "Good morning" start-of-day prompt is open. Wake notifications
     // fire twice (didWake + screensDidWake) before the user commits, which would
     // otherwise stack a second prompt on top of the first.
@@ -2875,7 +2897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Push a modal onto the stack. The new window appears on top; any windows
     /// beneath stay alive and re-surface as each modal above them closes.
-    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, onClose: (() -> Void)? = nil) {
+    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, stealFocus: Bool = false, onClose: (() -> Void)? = nil) {
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
         var styleMask: NSWindow.StyleMask = [.titled]
@@ -2894,8 +2916,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.delegate = delegate
         modalStack.append(window)
         modalDelegates.append(delegate)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        modalStealFocus.append(stealFocus)
+        surface(window, stealFocus: stealFocus)
+    }
+
+    // Bring a modal window forward. When `stealFocus` is true it activates the
+    // app and becomes key (start-of-day / random check-in); otherwise it floats
+    // into view without taking keyboard focus, so the user keeps typing in
+    // whatever they were doing until they choose to click the window.
+    private func surface(_ window: NSWindow, stealFocus: Bool) {
+        if stealFocus {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            window.orderFrontRegardless()
+        }
     }
 
     /// Remove a just-closed modal from the stack and bring the new top forward.
@@ -2903,10 +2938,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let i = modalStack.firstIndex(of: window) {
             modalStack.remove(at: i)
             modalDelegates.remove(at: i)
+            modalStealFocus.remove(at: i)
         }
         if let top = modalStack.last {
-            top.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            surface(top, stealFocus: modalStealFocus.last ?? false)
         }
     }
 
@@ -3000,7 +3035,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // day's flow: schedule a snooze so the task-input prompt reappears. No
         // response is recorded and the day stays un-marked, so the start-of-day
         // prompt can still show again on the next wake.
-        showWindow(view, allowClose: false, onClose: { [weak self] in
+        showWindow(view, allowClose: false, stealFocus: true, onClose: { [weak self] in
             self?.startOfDayPromptOpen = false
             if !committed { self?.pomodoroScheduler.scheduleSnooze() }
         })
@@ -3191,7 +3226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             },
             onSnooze: { committed = true; snooze() }
         )
-        showWindow(view, onClose: { if !committed { snooze() } })
+        showWindow(view, stealFocus: true, onClose: { if !committed { snooze() } })
     }
 
     @objc private func showHistory() { showWindow(HistoryView()) }
