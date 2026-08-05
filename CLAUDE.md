@@ -38,9 +38,11 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
 - `responses.json` - Experience sampling responses
 - `pomodoro-sessions.json` - Pomodoro session history (`taskDescription` is now
   always empty — the per-pomodoro goal feature was removed)
-- `anthropic-api-key.txt` - Claude API key for the focus coach
 - `todoist-api-token.txt` - Todoist API token (set in Settings → Focus)
 - `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
+- `coach-errors.log` - one line per focus-coach diagnostic (auth/network/HTTP failures,
+  retries, recoveries). Also mirrored to the unified log with an `[FocusCoach]` prefix.
+  There is no longer an `anthropic-api-key.txt`; see "Focus coach auth" below.
 - `meeting-attention-log.jsonl` - one line per meeting-drift nudge (`context`, `linger_seconds`)
 
 ## Meeting Attention
@@ -82,6 +84,68 @@ The Claude model used for both classification and coaching is configurable in
 Settings → Focus (`focusModel` in `UserDefaults`, defaults to
 `FocusMonitor.defaultModel` = `claude-sonnet-5`). `FocusMonitor.model` reads it
 and both API calls (`callClassifyAPI`, `callAPIWithTools`) use it.
+
+## Focus coach auth (Middleman + Hawk)
+
+Claude is reached through METR's Middleman proxy, **not** api.anthropic.com, and
+there is no API key on disk any more. `MiddlemanClient` posts to
+`<proxy-base-url>/anthropic/v1/messages` — Anthropic's native
+Messages API re-exposed verbatim, so request/response bodies are unchanged.
+
+The proxy host is **not** hardcoded: this repo is public and the hostname isn't.
+It is resolved at runtime from `defaults write org.metr.ExperienceSampling
+middlemanBaseURL <url>`, falling back to `HAWK_MIDDLEMAN_URL` in
+`~/.config/hawk-cli/env` (which hawk maintains, so a working hawk install needs no
+extra setup). With neither, calls fail as `proxy-not-configured`. Don't reintroduce
+a default hostname in source.
+
+Auth
+is `x-api-key: <hawk access token>` plus `anthropic-version: 2023-06-01`. Note the
+header: Middleman's `/openai/...` passthrough wants `Authorization: Bearer`, but
+the `/anthropic/...` one wants `x-api-key`.
+
+`HawkAuth` mints the token by shelling out to `hawk auth access-token`. hawk owns
+the whole OAuth story (the refresh token lives in the login keychain under
+`hawk-cli:<clientID>`, which only hawk's own binary has an ACL for), and refreshes
+silently when the access token is expiring — so automatic refresh is just "run
+hawk again". A non-zero exit means a real browser login is needed; that's the
+`invalid_grant` case. The token is cached in memory until 2 minutes before the
+JWT's `exp`. hawk is looked up by absolute path (`~/.local/bin/hawk`, Homebrew,
+`/usr/local/bin`) because a GUI app inherits a bare `PATH`; override with
+`defaults write org.metr.ExperienceSampling hawkPath /path/to/hawk`.
+
+**Failures are loud, never silent.** This is the whole point of the design: the
+old code collapsed every failure into `completion(nil)`, which made `classify`
+default to `on_task: true` with an empty message — a dead API key looked exactly
+like being on task. Now every failure becomes a `CoachError`
+(`hawkMissing` / `notAuthenticated` / `tokenRejected` / `networkUnavailable` /
+`modelNotEntitled` / `httpError` / `badResponse`), which is:
+
+- logged to `coach-errors.log` **always**,
+- shown as a `CoachErrorView` modal with an actionable message and a "Sign in to
+  Hawk" button (which opens Terminal on `hawk auth login` via a `.command` file,
+  so no Automation permission is needed),
+- pinned to a menu-bar row that stays until a call succeeds,
+- throttled per error kind (`CoachErrorThrottle`, 10 min) so a sustained outage
+  doesn't stack a modal on every 30s check; any success resets the throttle.
+
+Transient failures (network, 408/429/5xx) retry up to 3 attempts with 2s/6s
+backoff. Auth failures never retry in a loop — except a 401, which re-mints the
+token once (it may just be one we cached a moment too long) before giving up.
+
+Verify the whole chain end to end with **Debug → Test Coach Connection**, or
+headlessly with `open "experiencesampling://test-coach"` and then
+`tail ~/Library/Application\ Support/ExperienceSampling/coach-errors.log`. To
+exercise the failure paths, point `hawkPath` at a script that exits non-zero (→
+`notAuthenticated`) or prints a junk JWT (→ `tokenRejected`), set `focusModel` to
+a model Middleman lists but isn't entitled to (→ `modelNotEntitled`), or set
+`defaults write org.metr.ExperienceSampling middlemanBaseURL <unreachable-host>`
+(→ `networkUnavailable` plus the backoff path).
+
+Note on `max_tokens`: Sonnet 5 emits a (usually empty) `thinking` block first, so
+a tiny budget gets spent entirely on it and the response comes back with no text.
+Both call sites read the *first text block* rather than `content.first`, so a
+leading thinking block no longer reads as a failure.
 
 ## Gotchas
 

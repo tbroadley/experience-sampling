@@ -1117,6 +1117,553 @@ enum TodoistClient {
     }
 }
 
+// MARK: - Claude via METR's Middleman proxy
+
+/// Everything that can go wrong between the focus coach and Claude, kept as
+/// distinct cases for two reasons: the UI can then say something actionable
+/// ("log in to Hawk") instead of a shrug, and the retry policy can tell "wait a
+/// moment and try again" apart from "this will keep failing until the user does
+/// something". The old code collapsed all of these into `completion(nil)`, which
+/// made the coach go quiet with no signal at all.
+enum CoachError: Error, Equatable {
+    /// The hawk CLI isn't installed anywhere we look.
+    case hawkMissing(String)
+    /// hawk is installed but has no usable token, and refreshing didn't help —
+    /// a real browser login is required.
+    case notAuthenticated(String)
+    /// Middleman rejected a token we had just minted (401/403).
+    case tokenRejected(String)
+    /// Offline, DNS failure, timeout — worth retrying.
+    case networkUnavailable(String)
+    /// The configured model isn't one this Middleman key may call. `hawk models`
+    /// lists more models than the upstream provider keys are entitled to.
+    case modelNotEntitled(String)
+    /// Any other non-2xx from Middleman.
+    case httpError(status: Int, detail: String)
+    /// 2xx, but the body wasn't the shape we expect.
+    case badResponse(String)
+    /// No proxy base URL configured. Deliberately not defaulted in source — see
+    /// `MiddlemanClient.baseURL`.
+    case proxyNotConfigured(String)
+
+    /// Stable short name, used as the throttle key and in log lines.
+    var kind: String {
+        switch self {
+        case .hawkMissing: return "hawk-missing"
+        case .notAuthenticated: return "not-authenticated"
+        case .tokenRejected: return "token-rejected"
+        case .networkUnavailable: return "network-unavailable"
+        case .modelNotEntitled: return "model-not-entitled"
+        case .httpError(let status, _): return "http-\(status)"
+        case .badResponse: return "bad-response"
+        case .proxyNotConfigured: return "proxy-not-configured"
+        }
+    }
+
+    /// True when the fix is "the user authenticates". These are never retried in
+    /// a loop — a bad token retried every 30s just hammers Okta and hides the
+    /// problem instead of surfacing it.
+    var isAuthProblem: Bool {
+        switch self {
+        case .hawkMissing, .notAuthenticated, .tokenRejected: return true
+        default: return false
+        }
+    }
+
+    /// True when trying again shortly might just work.
+    var isTransient: Bool {
+        switch self {
+        case .networkUnavailable: return true
+        case .httpError(let status, _): return status == 408 || status == 429 || status >= 500
+        default: return false
+        }
+    }
+
+    /// Headline for the error modal and the menu-bar status item.
+    var title: String {
+        switch self {
+        case .hawkMissing: return "Focus coach: hawk CLI not found"
+        case .notAuthenticated: return "Focus coach: not signed in"
+        case .tokenRejected: return "Focus coach: sign-in expired"
+        case .networkUnavailable: return "Focus coach: can't reach Middleman"
+        case .modelNotEntitled: return "Focus coach: model unavailable"
+        case .httpError(let status, _): return "Focus coach: Middleman error \(status)"
+        case .badResponse: return "Focus coach: unexpected reply"
+        case .proxyNotConfigured: return "Focus coach: proxy not configured"
+        }
+    }
+
+    /// What the user should do about it.
+    var advice: String {
+        switch self {
+        case .hawkMissing:
+            return """
+            The coach talks to Claude through METR's Middleman proxy and needs the \
+            hawk CLI to mint an access token. Install it, or point the app at it with \
+            `defaults write org.metr.ExperienceSampling hawkPath /path/to/hawk`.
+            """
+        case .notAuthenticated, .tokenRejected:
+            return "Run `hawk auth login` and complete the browser flow. The coach picks the new token up on its next check."
+        case .networkUnavailable:
+            return "Middleman is only reachable on the METR network. Check your connection/VPN — the coach keeps retrying."
+        case .modelNotEntitled(let model):
+            return "The Middleman key isn't entitled to \"\(model)\". Pick a different model in Settings → Focus."
+        case .httpError:
+            return "Middleman returned an error. The coach will retry; if it persists, check Middleman's status."
+        case .badResponse:
+            return "Middleman replied with something the coach couldn't parse. See coach-errors.log for the detail."
+        case .proxyNotConfigured:
+            return """
+            No proxy URL is configured. hawk normally supplies it via \
+            HAWK_MIDDLEMAN_URL in ~/.config/hawk-cli/env; otherwise set one with \
+            `defaults write org.metr.ExperienceSampling middlemanBaseURL <url>`.
+            """
+        }
+    }
+
+    /// One-line detail for the log. Deliberately carries no token material —
+    /// only response bodies and hawk's stderr, never hawk's stdout.
+    var detail: String {
+        switch self {
+        case .hawkMissing(let d), .notAuthenticated(let d), .tokenRejected(let d),
+             .networkUnavailable(let d), .modelNotEntitled(let d), .badResponse(let d),
+             .proxyNotConfigured(let d):
+            return d
+        case .httpError(_, let d):
+            return d
+        }
+    }
+}
+
+/// Appends focus-coach diagnostics to `coach-errors.log` alongside the other data
+/// files, and mirrors them to the unified log (`log stream --predicate
+/// 'senderImagePath CONTAINS "ExperienceSampling"'`). The app had no logging at
+/// all before, so an auth failure left no trace anywhere.
+enum CoachLog {
+    static var fileURL: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("ExperienceSampling/coach-errors.log")
+    }
+
+    static func record(_ message: String) {
+        NSLog("[FocusCoach] %@", message)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        // One entry per line, so the file stays greppable even when the detail
+        // is a multi-line stderr dump from hawk.
+        let flattened = message.replacingOccurrences(of: "\n", with: " ⏎ ")
+        let line = "\(stamp) \(flattened)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: fileURL) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            handle.closeFile()
+        } else {
+            try? data.write(to: fileURL)
+        }
+    }
+
+    static func record(_ error: CoachError, context: String) {
+        record("\(context) failed [\(error.kind)]: \(error.detail)")
+    }
+}
+
+/// Mints the short-lived Middleman access token by shelling out to the hawk CLI.
+///
+/// hawk owns the whole OAuth story: the refresh token lives in the login
+/// keychain (service `hawk-cli:<clientID>`, which only hawk's own binary has an
+/// ACL for), and `hawk auth access-token` silently refreshes when the access
+/// token is expiring. So "refresh without user action" is simply "run hawk
+/// again", and the only case that needs a human is hawk exiting non-zero —
+/// which is exactly the `invalid_grant` / expired-refresh-token case.
+enum HawkAuth {
+    /// Where to look for hawk. A GUI app inherits a bare PATH
+    /// (/usr/bin:/bin:/usr/sbin:/sbin), so the bare name never resolves —
+    /// absolute candidates are required.
+    static var searchPaths: [String] {
+        [
+            "\(NSHomeDirectory())/.local/bin/hawk",
+            "/opt/homebrew/bin/hawk",
+            "/usr/local/bin/hawk",
+            "/usr/bin/hawk"
+        ]
+    }
+
+    /// Escape hatch for a non-standard install:
+    /// `defaults write org.metr.ExperienceSampling hawkPath /path/to/hawk`.
+    static func executablePath() -> String? {
+        let fm = FileManager.default
+        if let override = UserDefaults.standard.string(forKey: "hawkPath")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            return fm.isExecutableFile(atPath: override) ? override : nil
+        }
+        return searchPaths.first { fm.isExecutableFile(atPath: $0) }
+    }
+
+    /// Ask hawk for a new token this far before the current one actually expires,
+    /// so a token never dies mid-request.
+    static let expiryMargin: TimeInterval = 120
+    /// hawk is a Python CLI and may have to do a network refresh, so it's not
+    /// instant — but it must not hang the coach either.
+    static let subprocessTimeout: TimeInterval = 30
+
+    private static let lock = NSLock()
+    private static var cachedToken: String?
+    private static var cachedExpiry: Date?
+
+    /// Drop the cached token so the next call re-runs hawk. Used when Middleman
+    /// rejects a token we thought was good.
+    static func invalidateCachedToken() {
+        lock.lock()
+        cachedToken = nil
+        cachedExpiry = nil
+        lock.unlock()
+    }
+
+    /// A usable access token. **Blocking** — it may spawn a subprocess, so call
+    /// it from a background queue, never the main thread.
+    static func token(forceRefresh: Bool = false) -> Result<String, CoachError> {
+        if !forceRefresh, let cached = cachedTokenIfFresh() { return .success(cached) }
+
+        guard let path = executablePath() else {
+            return .failure(.hawkMissing("no hawk executable at any of: \(searchPaths.joined(separator: ", "))"))
+        }
+
+        guard let run = runHawk(path: path, arguments: ["auth", "access-token"]) else {
+            return .failure(.notAuthenticated("`hawk auth access-token` did not finish within \(Int(subprocessTimeout))s"))
+        }
+
+        // Only stderr is ever logged or wrapped in an error — stdout is the token.
+        guard run.status == 0 else {
+            let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let reason = stderr.isEmpty ? "exit status \(run.status)" : String(stderr.suffix(400))
+            return .failure(.notAuthenticated(reason))
+        }
+
+        let token = run.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            return .failure(.notAuthenticated("`hawk auth access-token` succeeded but printed nothing"))
+        }
+
+        lock.lock()
+        cachedToken = token
+        cachedExpiry = expiry(fromJWT: token)
+        lock.unlock()
+        return .success(token)
+    }
+
+    private static func cachedTokenIfFresh() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let token = cachedToken else { return nil }
+        // No parseable expiry means we can't reason about freshness, so don't
+        // trust the cache — hawk is cheap enough to re-run.
+        guard let expiry = cachedExpiry else { return nil }
+        return expiry.timeIntervalSinceNow > expiryMargin ? token : nil
+    }
+
+    /// Opens Terminal on `hawk auth login` for the cases a token refresh can't
+    /// fix. Writing a `.command` file and handing it to LaunchServices runs it in
+    /// a new Terminal window without needing Automation permission, which driving
+    /// Terminal via AppleScript would.
+    @discardableResult
+    static func launchInteractiveLogin() -> Bool {
+        guard let path = executablePath() else { return false }
+        let script = """
+        #!/bin/bash
+        echo "Signing in to Hawk for the Experience Sampling focus coach…"
+        "\(path)" auth login
+        echo
+        echo "Done — you can close this window. The coach picks the new token up on its next check."
+        """
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("hawk-auth-login.command")
+        guard (try? script.write(to: url, atomically: true, encoding: .utf8)) != nil,
+              (try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)) != nil else {
+            return false
+        }
+        invalidateCachedToken()
+        return NSWorkspace.shared.open(url)
+    }
+
+    /// Reads `exp` out of a JWT payload *without* validating the signature. We
+    /// only need to know when to ask hawk for a fresh one; Middleman does the
+    /// real verification.
+    static func expiry(fromJWT jwt: String) -> Date? {
+        let segments = jwt.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count >= 2 else { return nil }
+        var base64 = String(segments[1]).replacingOccurrences(of: "-", with: "+")
+                                        .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = json["exp"] as? Double else { return nil }
+        return Date(timeIntervalSince1970: exp)
+    }
+
+    /// Runs hawk and captures both streams. Returns nil if it overran the
+    /// timeout (the process is terminated in that case).
+    private static func runHawk(path: String, arguments: [String]) -> (status: Int32, stdout: String, stderr: String)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        // hawk reads ~/.config/hawk-cli/env itself, so it just needs HOME and a
+        // PATH sane enough for its interpreter shebang.
+        var env = ProcessInfo.processInfo.environment
+        env["HOME"] = NSHomeDirectory()
+        env["PATH"] = "\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        process.environment = env
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        do {
+            try process.run()
+        } catch {
+            return (status: -1, stdout: "", stderr: "could not launch \(path): \(error.localizedDescription)")
+        }
+
+        // Read both pipes on background queues: hawk's output is small, but a
+        // full pipe buffer would deadlock waitUntilExit().
+        var outData = Data()
+        var errData = Data()
+        let group = DispatchGroup()
+        for (pipe, sink) in [(outPipe, { outData = $0 }), (errPipe, { errData = $0 })] as [(Pipe, (Data) -> Void)] {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                sink(pipe.fileHandleForReading.readDataToEndOfFile())
+                group.leave()
+            }
+        }
+
+        let deadline = DispatchTime.now() + subprocessTimeout
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline, execute: watchdog)
+        process.waitUntilExit()
+        watchdog.cancel()
+        _ = group.wait(timeout: deadline)
+
+        if process.terminationReason == .uncaughtSignal { return nil }
+        return (status: process.terminationStatus,
+                stdout: String(bytes: outData, encoding: .utf8) ?? "",
+                stderr: String(bytes: errData, encoding: .utf8) ?? "")
+    }
+}
+
+/// Anthropic-shaped calls routed through METR's Middleman proxy.
+///
+/// Middleman re-exposes Anthropic's native Messages API verbatim under
+/// `/anthropic`, so request and response bodies are byte-for-byte what
+/// api.anthropic.com wanted. The only differences from the old direct path are
+/// the host and that `x-api-key` carries a short-lived hawk access token instead
+/// of a long-lived Anthropic key on disk.
+enum MiddlemanClient {
+    /// The proxy host is deliberately NOT hardcoded here. This repo is public and
+    /// the hostname isn't, so it comes from configuration at runtime instead:
+    ///
+    ///   1. `defaults write org.metr.ExperienceSampling middlemanBaseURL <url>`
+    ///   2. `HAWK_MIDDLEMAN_URL` in `~/.config/hawk-cli/env`, which hawk already
+    ///      maintains — so a working hawk install needs no extra setup here.
+    ///
+    /// With neither, calls fail as `.proxyNotConfigured` rather than silently
+    /// falling back to somewhere that would only reject the hawk token anyway.
+    static var baseURL: String? {
+        if let override = UserDefaults.standard.string(forKey: "middlemanBaseURL")?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            return override
+        }
+        return hawkEnvValue(for: "HAWK_MIDDLEMAN_URL")
+    }
+
+    /// Reads a single `KEY=value` out of hawk's env file. Ignores blank lines and
+    /// `#` comments, and strips surrounding quotes.
+    static func hawkEnvValue(for key: String, envPath: URL? = nil) -> String? {
+        let path = envPath ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/hawk-cli/env")
+        guard let contents = try? String(contentsOf: path, encoding: .utf8) else { return nil }
+        for line in contents.split(separator: "\n", omittingEmptySubsequences: true) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.hasPrefix("#"), let eq = trimmed.firstIndex(of: "=") else { continue }
+            guard trimmed[trimmed.startIndex..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
+            let value = trimmed[trimmed.index(after: eq)...]
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    static var messagesURL: URL? {
+        guard let baseURL else { return nil }
+        return URL(string: "\(baseURL)/anthropic/v1/messages")
+    }
+    static let anthropicVersion = "2023-06-01"
+    static let requestTimeout: TimeInterval = 60
+
+    /// Total tries for a single logical call. Only transient failures consume
+    /// them; auth problems bail out immediately.
+    static let maxAttempts = 3
+
+    /// Backoff before try `attempt + 1`. Deliberately short — a focus check every
+    /// 30s shouldn't have a request still limping along when the next one starts.
+    static func backoffDelay(afterAttempt attempt: Int) -> TimeInterval {
+        [2.0, 6.0][min(max(attempt, 1), 2) - 1]
+    }
+
+    /// Maps a non-2xx Middleman response onto a `CoachError`. Pure, so the
+    /// classification is unit-tested rather than only exercised against the live
+    /// proxy. `body` is Anthropic's error envelope:
+    /// `{"type":"error","error":{"type":"...","message":"..."}}`.
+    static func classify(status: Int, body: Data, model: String) -> CoachError {
+        let json = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+        let errorObject = json?["error"] as? [String: Any]
+        let errorType = errorObject?["type"] as? String ?? ""
+        let message = errorObject?["message"] as? String ?? (String(bytes: body.prefix(400), encoding: .utf8) ?? "")
+        let detail = "HTTP \(status) \(errorType.isEmpty ? "" : "\(errorType): ")\(message)"
+
+        switch status {
+        case 401, 403:
+            return .tokenRejected(detail)
+        case 404 where errorType == "not_found_error" && message.contains("model"):
+            // `hawk models` lists snapshots the upstream provider key can't
+            // actually call; those come back as a 404 naming the model.
+            return .modelNotEntitled(model)
+        default:
+            return .httpError(status: status, detail: detail)
+        }
+    }
+
+    /// URLSession failures that mean "the network, not the server". These are the
+    /// ones worth backing off and retrying rather than shouting about.
+    static func isNetworkFailure(_ error: NSError) -> Bool {
+        guard error.domain == NSURLErrorDomain else { return false }
+        return [
+            NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost,
+            NSURLErrorTimedOut, NSURLErrorCannotFindHost, NSURLErrorCannotConnectToHost,
+            NSURLErrorDNSLookupFailed, NSURLErrorInternationalRoamingOff,
+            NSURLErrorDataNotAllowed, NSURLErrorSecureConnectionFailed
+        ].contains(error.code)
+    }
+
+    /// Serializes token minting (which shells out to hawk) and owns the retry
+    /// timers, so nothing here ever runs on the main thread.
+    private static let queue = DispatchQueue(label: "org.metr.ExperienceSampling.middleman")
+
+    /// One Messages API round trip, with token refresh and retries folded in.
+    /// The success value is the decoded top-level response object.
+    static func sendMessages(model: String,
+                             systemPrompt: String,
+                             messages: [[String: Any]],
+                             tools: [[String: Any]] = [],
+                             maxTokens: Int = 300,
+                             completion: @escaping (Result<[String: Any], CoachError>) -> Void) {
+        var body: [String: Any] = [
+            "model": model,
+            "max_tokens": maxTokens,
+            "system": systemPrompt,
+            "messages": messages
+        ]
+        if !tools.isEmpty { body["tools"] = tools }
+        queue.async { attempt(1, body: body, model: model, didForceRefresh: false, completion: completion) }
+    }
+
+    private static func attempt(_ number: Int,
+                                body: [String: Any],
+                                model: String,
+                                didForceRefresh: Bool,
+                                completion: @escaping (Result<[String: Any], CoachError>) -> Void) {
+        guard let url = messagesURL else {
+            completion(.failure(.proxyNotConfigured(
+                "no middlemanBaseURL default and no HAWK_MIDDLEMAN_URL in ~/.config/hawk-cli/env")))
+            return
+        }
+        switch HawkAuth.token(forceRefresh: didForceRefresh) {
+        case .failure(let error):
+            completion(.failure(error))
+        case .success(let token):
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            // Middleman's Anthropic passthrough takes the hawk token in the same
+            // header Anthropic uses for its own keys — NOT `Authorization: Bearer`,
+            // which is what the /openai/... passthrough wants.
+            request.setValue(token, forHTTPHeaderField: "x-api-key")
+            request.setValue(anthropicVersion, forHTTPHeaderField: "anthropic-version")
+            request.setValue("application/json", forHTTPHeaderField: "content-type")
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+            request.timeoutInterval = requestTimeout
+
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                queue.async {
+                    let outcome = interpret(data: data, response: response, error: error, model: model)
+                    switch outcome {
+                    case .success(let json):
+                        completion(.success(json))
+                    case .failure(let coachError):
+                        // A rejected token might just be one we cached a moment too
+                        // long. Re-mint once and try again immediately; if the fresh
+                        // one is rejected too, it's a real auth failure.
+                        if case .tokenRejected = coachError, !didForceRefresh {
+                            HawkAuth.invalidateCachedToken()
+                            CoachLog.record("token rejected by Middleman; re-minting and retrying once")
+                            attempt(number, body: body, model: model, didForceRefresh: true, completion: completion)
+                            return
+                        }
+                        guard coachError.isTransient, number < maxAttempts else {
+                            completion(.failure(coachError))
+                            return
+                        }
+                        let delay = backoffDelay(afterAttempt: number)
+                        CoachLog.record("attempt \(number) failed [\(coachError.kind)]; retrying in \(Int(delay))s")
+                        queue.asyncAfter(deadline: .now() + delay) {
+                            attempt(number + 1, body: body, model: model,
+                                    didForceRefresh: didForceRefresh, completion: completion)
+                        }
+                    }
+                }
+            }.resume()
+        }
+    }
+
+    private static func interpret(data: Data?, response: URLResponse?, error: Error?, model: String) -> Result<[String: Any], CoachError> {
+        if let error {
+            let nsError = error as NSError
+            let detail = "\(nsError.domain) \(nsError.code): \(nsError.localizedDescription)"
+            return .failure(isNetworkFailure(nsError) ? .networkUnavailable(detail) : .httpError(status: 0, detail: detail))
+        }
+        guard let http = response as? HTTPURLResponse else {
+            return .failure(.badResponse("no HTTP response"))
+        }
+        let data = data ?? Data()
+        guard (200..<300).contains(http.statusCode) else {
+            return .failure(classify(status: http.statusCode, body: data, model: model))
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .failure(.badResponse("200 but body was not a JSON object (\(data.count) bytes)"))
+        }
+        return .success(json)
+    }
+}
+
+/// Keeps a persistent outage from becoming a modal every 30 seconds: the first
+/// failure of a kind is loud, repeats of that same kind stay quiet for
+/// `interval`, and any success clears the memory so the next failure is loud
+/// again. Pure state so the policy is unit-tested.
+struct CoachErrorThrottle {
+    static let interval: TimeInterval = 10 * 60
+
+    private var lastSurfaced: [String: Date] = [:]
+
+    mutating func shouldSurface(_ error: CoachError, now: Date = Date()) -> Bool {
+        if let last = lastSurfaced[error.kind], now.timeIntervalSince(last) < Self.interval { return false }
+        lastSurfaced[error.kind] = now
+        return true
+    }
+
+    var hasRecordedFailures: Bool { !lastSurfaced.isEmpty }
+
+    mutating func reset() { lastSurfaced.removeAll() }
+}
+
 final class FocusMonitor {
     private var timer: Timer?
     private var isShowingIntervention = false
@@ -1155,6 +1702,14 @@ final class FocusMonitor {
     // already open, so the coach can append a fresh nudge to the live conversation.
     var onFollowUpMessage: ((String) -> Void)?
     var onTopTodoChanged: ((String?) -> Void)?
+    /// Fired (on the main queue) when a call to Claude fails in a way the user
+    /// needs to know about. Throttled per error kind by `coachErrorThrottle` so a
+    /// sustained outage doesn't stack a modal on every check.
+    var onCoachError: ((CoachError) -> Void)?
+    /// Fired (on the main queue) the first time a call succeeds after failures,
+    /// so the UI can clear its "coach is broken" indicator.
+    var onCoachRecovered: (() -> Void)?
+    private var coachErrorThrottle = CoachErrorThrottle()
     // Seconds left in the current work pomodoro, or nil if not in a work phase.
     // Wired to PomodoroScheduler so the coach knows how much time remains.
     var workTimeRemaining: (() -> Int?)?
@@ -1202,6 +1757,22 @@ final class FocusMonitor {
         isShowingIntervention = false
         isRespondingToUser = false
         conversationHistory = []
+    }
+
+    /// Log every coach failure, and surface the ones the user hasn't just been
+    /// told about. Always logs — the throttle only gates the UI, never the log.
+    private func reportCoachError(_ error: CoachError, context: String) {
+        CoachLog.record(error, context: context)
+        guard coachErrorThrottle.shouldSurface(error) else { return }
+        DispatchQueue.main.async { self.onCoachError?(error) }
+    }
+
+    /// A successful call clears the throttle, so the next failure is loud again.
+    private func noteCoachSuccess() {
+        guard coachErrorThrottle.hasRecordedFailures else { return }
+        coachErrorThrottle.reset()
+        CoachLog.record("coach recovered — a call succeeded after earlier failures")
+        DispatchQueue.main.async { self.onCoachRecovered?() }
     }
 
     private func recordScreen(_ context: String, topTodo: String) {
@@ -1378,12 +1949,18 @@ final class FocusMonitor {
             systemPrompt += endorsedContexts.map { "  - \($0)" }.joined(separator: "\n")
         }
 
-        callAPIWithTools(systemPrompt: systemPrompt, messages: conversationHistory, tools: conversationTools) { [weak self] response in
+        callAPIWithTools(systemPrompt: systemPrompt, messages: conversationHistory, tools: conversationTools) { [weak self] result in
             guard let self else { return }
             self.isRespondingToUser = false
-            guard let response else {
-                completion("Sorry — I couldn't reach the coach just now. Try again in a moment.")
+            let response: Any
+            switch result {
+            case .failure(let error):
+                // Say what actually went wrong rather than a vague shrug — the
+                // chat window is the surface the user is already looking at.
+                completion("⚠️ \(error.title). \(error.advice)")
                 return
+            case .success(let value):
+                response = value
             }
             self.conversationHistory.append(["role": "assistant", "content": response, "ts": Date()])
             let text = (response as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? (response as? String) ?? ""
@@ -1391,16 +1968,9 @@ final class FocusMonitor {
         }
     }
 
-    private func callAPIWithTools(systemPrompt: String, messages: [[String: Any]], tools: [[String: Any]], completion: @escaping (Any?) -> Void) {
-        guard let apiKey = readAPIKey(), !apiKey.isEmpty else { completion(nil); return }
-
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-
-        // The Anthropic API rejects unknown keys on messages, so drop our internal
+    private func callAPIWithTools(systemPrompt: String, messages: [[String: Any]], tools: [[String: Any]],
+                                  completion: @escaping (Result<Any, CoachError>) -> Void) {
+        // The Messages API rejects unknown keys on messages, so drop our internal
         // `ts` before sending; fold the timestamp into the text so the coach still
         // sees when each turn happened.
         let apiMessages: [[String: Any]] = messages.map { msg in
@@ -1412,23 +1982,25 @@ final class FocusMonitor {
             return out
         }
 
-        var body: [String: Any] = [
-            "model": model,
-            "max_tokens": 300,
-            "system": systemPrompt,
-            "messages": apiMessages
-        ]
-        if !tools.isEmpty { body["tools"] = tools }
+        MiddlemanClient.sendMessages(model: model, systemPrompt: systemPrompt, messages: apiMessages, tools: tools) { [weak self] result in
+            guard let self else { return }
+            let json: [String: Any]
+            switch result {
+            case .failure(let error):
+                self.reportCoachError(error, context: "coach reply")
+                completion(.failure(error))
+                return
+            case .success(let payload):
+                json = payload
+            }
 
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
-            guard let self, let data, error == nil,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let content = json["content"] as? [[String: Any]] else {
-                completion(nil)
+            guard let content = json["content"] as? [[String: Any]] else {
+                let error = CoachError.badResponse("Messages response had no `content` array")
+                self.reportCoachError(error, context: "coach reply")
+                completion(.failure(error))
                 return
             }
+            self.noteCoachSuccess()
 
             let stopReason = json["stop_reason"] as? String
             if stopReason == "tool_use", let toolBlock = content.first(where: { $0["type"] as? String == "tool_use" }) {
@@ -1456,9 +2028,9 @@ final class FocusMonitor {
                     continueWith("done")
                 }
             } else {
-                completion(content)
+                completion(.success(content))
             }
-        }.resume()
+        }
     }
 
     private func requestAccessibilityIfNeeded() {
@@ -1679,39 +2251,23 @@ final class FocusMonitor {
     }
 
     private func callClassifyAPI(systemPrompt: String, messages: [[String: Any]], completion: @escaping (String?) -> Void) {
-        guard let apiKey = readAPIKey(), !apiKey.isEmpty else { completion(nil); return }
-
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-
-        let body: [String: Any] = [
-            "model": model,
-            "max_tokens": 300,
-            "system": systemPrompt,
-            "messages": messages
-        ]
-
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-
-        URLSession.shared.dataTask(with: request) { data, _, error in
-            guard let data, error == nil,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let content = json["content"] as? [[String: Any]],
-                  let text = content.first?["text"] as? String else {
+        MiddlemanClient.sendMessages(model: model, systemPrompt: systemPrompt, messages: messages) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.reportCoachError(error, context: "focus classification")
                 completion(nil)
-                return
+            case .success(let json):
+                guard let content = json["content"] as? [[String: Any]],
+                      let text = content.compactMap({ $0["text"] as? String }).first else {
+                    self.reportCoachError(.badResponse("classification response had no text block"), context: "focus classification")
+                    completion(nil)
+                    return
+                }
+                self.noteCoachSuccess()
+                completion(text)
             }
-            completion(text)
-        }.resume()
-    }
-
-    private func readAPIKey() -> String? {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let keyFile = appSupport.appendingPathComponent("ExperienceSampling/anthropic-api-key.txt")
-        return try? String(contentsOf: keyFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     private func logCheck(context: String, onTask: Bool, message: String) {
@@ -2241,15 +2797,13 @@ struct SettingsView: View {
     @AppStorage("meetingAllowlist") private var meetingAllowlist = MeetingAttentionMonitor.defaultAllowlist
 
     @State private var selectedTab = 0
-    @State private var apiKey: String = ""
-    @State private var apiKeySaved = false
     @State private var todoistToken: String = ""
     @State private var todoistTokenSaved = false
-
-    private var apiKeyFileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("ExperienceSampling/anthropic-api-key.txt")
-    }
+    // Result of the last "Check connection" — a real round trip to Middleman, so
+    // the user can confirm the coach works without waiting for a focus check.
+    @State private var claudeStatus: String = ""
+    @State private var claudeStatusOK = false
+    @State private var isCheckingClaude = false
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -2279,13 +2833,17 @@ struct SettingsView: View {
                 Toggle("Enable focus monitoring", isOn: $focusEnabled)
                 Stepper("Check every \(focusInterval)s", value: $focusInterval, in: 10...120, step: 10)
                 TextField("Model", text: $focusModel)
+                // Claude goes through METR's Middleman proxy with a short-lived
+                // Hawk token — there's no key to paste, only a sign-in to keep alive.
                 HStack {
-                    SecureField("Anthropic API Key", text: $apiKey)
-                        .onSubmit { saveAPIKey() }
-                    Button("Save") { saveAPIKey() }
+                    Button(isCheckingClaude ? "Checking…" : "Check Claude connection") { checkClaudeConnection() }
+                        .disabled(isCheckingClaude)
+                    Button("Sign in to Hawk") { HawkAuth.launchInteractiveLogin() }
                 }
-                Text(apiKeySaved ? "Key saved" : (apiKey.isEmpty ? "No API key set" : "Press Save to apply"))
-                    .font(.caption).foregroundColor(apiKeySaved ? .green : .secondary)
+                Text(claudeStatus.isEmpty ? "Claude runs through Middleman using your Hawk sign-in." : claudeStatus)
+                    .font(.caption)
+                    .foregroundColor(claudeStatus.isEmpty ? .secondary : (claudeStatusOK ? .green : .red))
+                    .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     SecureField("Todoist API Token", text: $todoistToken)
                         .onSubmit { saveTodoistToken() }
@@ -2316,17 +2874,32 @@ struct SettingsView: View {
         }
         .padding()
         .frame(width: 340, height: 320)
-        .onAppear { loadAPIKey(); loadTodoistToken() }
+        .onAppear { loadTodoistToken() }
     }
 
-    private func loadAPIKey() {
-        apiKey = (try? String(contentsOf: apiKeyFileURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
-        apiKeySaved = !apiKey.isEmpty
-    }
-
-    private func saveAPIKey() {
-        try? apiKey.trimmingCharacters(in: .whitespacesAndNewlines).write(to: apiKeyFileURL, atomically: true, encoding: .utf8)
-        apiKeySaved = true
+    // A real (tiny) Middleman call with the configured model, so this proves the
+    // whole chain — hawk token, proxy, model entitlement — not just one link.
+    private func checkClaudeConnection() {
+        isCheckingClaude = true
+        claudeStatus = ""
+        let model = focusModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        MiddlemanClient.sendMessages(model: model.isEmpty ? FocusMonitor.defaultModel : model,
+                                     systemPrompt: "Reply with the single word OK.",
+                                     messages: [["role": "user", "content": "ping"]],
+                                     maxTokens: 64) { result in
+            DispatchQueue.main.async {
+                isCheckingClaude = false
+                switch result {
+                case .success:
+                    claudeStatusOK = true
+                    claudeStatus = "Connected to Middleman as \(model.isEmpty ? FocusMonitor.defaultModel : model)."
+                case .failure(let error):
+                    CoachLog.record(error, context: "settings connection check")
+                    claudeStatusOK = false
+                    claudeStatus = "\(error.title). \(error.advice)"
+                }
+            }
+        }
     }
 
     private func loadTodoistToken() {
@@ -2478,6 +3051,77 @@ struct EventNoticeView: View {
         }
         .padding(24)
         .frame(width: 300)
+    }
+}
+
+/// Confirmation for the coach connection check — the happy-path counterpart to
+/// `CoachErrorView`.
+struct CoachOKView: View {
+    let model: String
+    let reply: String
+    var onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundColor(.green)
+                Text("Focus coach connected").font(.system(size: 20, weight: .bold))
+            }
+            Text("\(model) via Middleman replied \"\(reply)\".")
+                .font(.body)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("OK") { onDismiss() }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(24)
+        .frame(width: 400)
+    }
+}
+
+/// Shown when the focus coach can't reach Claude. The point is that the failure
+/// is impossible to miss and says what to do about it — the old behaviour was to
+/// go silent, so a dead API key looked exactly like "you're on task".
+struct CoachErrorView: View {
+    let error: CoachError
+    var onSignIn: () -> Void
+    var onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundColor(.orange)
+                Text(error.title).font(.system(size: 20, weight: .bold))
+            }
+            Text(error.advice)
+                .font(.body)
+                .foregroundColor(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(error.detail)
+                .font(.caption.monospaced())
+                .foregroundColor(.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 12) {
+                Spacer()
+                Button("Dismiss") { onDismiss() }
+                    .keyboardShortcut(.escape, modifiers: [])
+                if error.isAuthProblem {
+                    Button("Sign in to Hawk") { onSignIn() }
+                        .keyboardShortcut(.return, modifiers: [])
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
     }
 }
 
@@ -2678,6 +3322,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var abandonMenuItem: NSMenuItem?
     private var currentTaskMenuItem: NSMenuItem?
     private var takeBreakNowMenuItem: NSMenuItem?
+    // A persistent, non-nagging signal that the coach is broken: the modal is
+    // throttled, but this menu row stays until a call succeeds. Clicking it
+    // re-opens the full explanation.
+    private var coachStatusMenuItem: NSMenuItem?
+    private var lastCoachError: CoachError?
     // The live top Todoist to-do the focus coach is tracking, shown in the menu.
     private var topTodo: String = ""
     private var intradaySnoozeTimer: Timer?
@@ -2749,6 +3398,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         focusMonitor.onTopTodoChanged = { [weak self] todo in
             self?.topTodo = todo ?? ""
         }
+        focusMonitor.onCoachError = { [weak self] error in
+            self?.showCoachError(error)
+        }
+        focusMonitor.onCoachRecovered = { [weak self] in
+            self?.lastCoachError = nil
+            self?.coachStatusMenuItem?.isHidden = true
+        }
 
         meetingMonitor.onNudge = { [weak self] in self?.showMeetingNudge() }
         meetingMonitor.isInScheduledMeeting = { [weak self] in self?.calendarMonitor.isInVideoMeeting() ?? false }
@@ -2779,8 +3435,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             pomodoroScheduler.workDurationOverride = availableWorkMinutes()
             pomodoroScheduler.startWork()
+        case "test-coach":
+            checkCoachConnection()
         default:
             break
+        }
+    }
+
+    /// End-to-end probe of the coach's path to Claude: mint a Hawk token, call
+    /// Middleman with the configured model, and report either way. Reachable from
+    /// the Debug menu and as `experiencesampling://test-coach` so the whole chain
+    /// can be verified without waiting for a focus check to come round.
+    @objc private func checkCoachConnection() {
+        let model = UserDefaults.standard.string(forKey: "focusModel")?
+            .trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOr(FocusMonitor.defaultModel)
+            ?? FocusMonitor.defaultModel
+        CoachLog.record("connection check starting (model \(model), \(MiddlemanClient.messagesURL?.absoluteString ?? "<no proxy configured>"))")
+        // 64 rather than a handful: Sonnet 5 emits a (usually empty) thinking
+        // block first, and too small a budget gets spent entirely on it, so the
+        // probe comes back with no text and looks like a failure when it isn't.
+        MiddlemanClient.sendMessages(model: model,
+                                     systemPrompt: "Reply with the single word OK.",
+                                     messages: [["role": "user", "content": "ping"]],
+                                     maxTokens: 64) { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let json):
+                    let text = (json["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? ""
+                    CoachLog.record("connection check OK (model \(model)) — replied \"\(text)\"")
+                    self?.lastCoachError = nil
+                    self?.coachStatusMenuItem?.isHidden = true
+                    self?.showCoachOK(model: model, reply: text)
+                case .failure(let error):
+                    CoachLog.record(error, context: "connection check")
+                    self?.showCoachError(error)
+                }
+            }
         }
     }
 
@@ -2806,6 +3496,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         abandon.isEnabled = false
         abandonMenuItem = abandon
         menu.addItem(abandon)
+
+        let coachStatus = NSMenuItem(title: "", action: #selector(showLastCoachError), keyEquivalent: "")
+        coachStatus.isHidden = true
+        coachStatusMenuItem = coachStatus
+        menu.addItem(coachStatus)
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(title: "View History", action: #selector(showHistory), keyEquivalent: "h"))
@@ -2818,6 +3513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         debug.addItem(NSMenuItem(title: "Show Pomodoro Start", action: #selector(showPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Show Meeting Nudge", action: #selector(debugShowMeetingNudge), keyEquivalent: ""))
+        debug.addItem(NSMenuItem(title: "Test Coach Connection", action: #selector(checkCoachConnection), keyEquivalent: ""))
         let debugItem = NSMenuItem(title: "Debug", action: nil, keyEquivalent: "")
         debugItem.submenu = debug
         menu.addItem(debugItem)
@@ -3131,6 +3827,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showWindow(view)
     }
 
+    private func showCoachOK(model: String, reply: String) {
+        let view = CoachOKView(model: model, reply: reply, onDismiss: { [weak self] in self?.closeTopModal() })
+        showWindow(view)
+    }
+
+    /// Surface a coach failure: a modal now (the monitor throttles how often this
+    /// is called) plus a menu row that persists until a call succeeds.
+    private func showCoachError(_ error: CoachError) {
+        lastCoachError = error
+        coachStatusMenuItem?.title = "⚠︎ \(error.title)"
+        coachStatusMenuItem?.isHidden = false
+        presentCoachError(error)
+    }
+
+    @objc private func showLastCoachError() {
+        guard let error = lastCoachError else { return }
+        presentCoachError(error)
+    }
+
+    private func presentCoachError(_ error: CoachError) {
+        let view = CoachErrorView(
+            error: error,
+            onSignIn: { [weak self] in
+                HawkAuth.launchInteractiveLogin()
+                self?.closeTopModal()
+            },
+            onDismiss: { [weak self] in self?.closeTopModal() }
+        )
+        showWindow(view)
+    }
+
     // Start the pending break immediately. Used from the menu after the user has
     // snoozed a break and is now ready — no confirmation modal, since asking to
     // start the break is itself the confirmation.
@@ -3249,6 +3976,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
 extension Int {
     func nonZeroOr(_ d: Int) -> Int { self != 0 ? self : d }
+}
+extension String {
+    func nonEmptyOr(_ d: String) -> String { isEmpty ? d : self }
 }
 extension Double {
     func nonZeroOr(_ d: Double) -> Double { self != 0 ? self : d }
