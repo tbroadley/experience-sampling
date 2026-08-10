@@ -601,12 +601,117 @@ section("CoachError: every case is user-presentable")
 do {
     let all: [CoachError] = [
         .hawkMissing("x"), .notAuthenticated("x"), .tokenRejected("x"), .networkUnavailable("x"),
-        .modelNotEntitled("claude-sonnet-5"), .httpError(status: 500, detail: "x"), .badResponse("x")
+        .modelNotEntitled("claude-sonnet-5"), .httpError(status: 500, detail: "x"), .badResponse("x"),
+        .proxyNotConfigured("x"), .tasksNotConfigured("x"), .tasksAuthRequired("x"), .tasksUnavailable("x")
     ]
     check(all.allSatisfy { !$0.title.isEmpty }, "all cases have a title")
     check(all.allSatisfy { !$0.advice.isEmpty }, "all cases have advice")
     check(Set(all.map(\.kind)).count == all.count, "kinds are distinct, so the throttle can't conflate them")
     check(!all.contains { $0.isAuthProblem && $0.isTransient }, "no case is both an auth problem and retried as transient")
+}
+
+section("TasksClient: the sheet is read the way status-dashboard writes it")
+do {
+    // A: id | B: content | C: project | D: description | E: due
+    // F: recurrence | G: order | H: done | I: completed_at
+    func row(_ cells: String...) -> [String] {
+        cells + Array(repeating: "", count: max(0, 9 - cells.count))
+    }
+    let today = "2026-08-10"
+    let rows = [
+        row("a", "Overdue thing", "", "", "2026-08-07", "", "5", "FALSE"),
+        row("b", "Top thing", "", "", today, "", "-2", "FALSE"),
+        row("c", "Already done", "", "", today, "", "-9", "TRUE", "2026-08-10T09:15:00-04:00"),
+        row("d", "Tomorrow's thing", "", "", "2026-08-11", "", "-7", "FALSE"),
+        row("e", "No due date", "", "", "", "", "-8", "FALSE"),
+        row("f", "Done yesterday", "", "", "2026-08-09", "", "3", "TRUE", "2026-08-09T17:00:00-04:00")
+    ]
+
+    checkEqual(TasksClient.topTodo(rows: rows, today: today)?.content, "Top thing",
+               "lowest order among today's incomplete tasks wins")
+    checkEqual(TasksClient.topTodo(rows: rows, today: "2026-08-07")?.content, "Overdue thing",
+               "a future task never becomes the top to-do")
+    check(TasksClient.topTodo(rows: [row("x", "Done", "", "", today, "", "0", "TRUE")], today: today) == nil,
+          "a fully-completed list has no top to-do")
+
+    let completed = TasksClient.completedToday(rows: rows, today: today)
+    checkEqual(completed.count, 1, "only today's completions count")
+    checkEqual(completed.first?.content, "Already done", "and they carry their content")
+
+    checkEqual(TasksClient.newTaskRow(content: "Ship it", id: "id-1", today: today),
+               ["id-1", "Ship it", "", "", today, "", "0", "FALSE", ""],
+               "a new row matches status-dashboard's column layout")
+
+    check(TasksClient.isTrue("TRUE") && TasksClient.isTrue(" true "), "done is case- and space-insensitive")
+    check(!TasksClient.isTrue("") && !TasksClient.isTrue("FALSE"), "anything else is not done")
+
+    let env = """
+    # tasks live in a sheet now
+    export TASKS_SPREADSHEET_ID="sheet-123"
+    LINEAR_BW_ITEM=Linear API key
+    """
+    checkEqual(TasksClient.parseEnvValue(env, key: "TASKS_SPREADSHEET_ID"), "sheet-123",
+               "the spreadsheet ID is inherited from status-dashboard's env file")
+    check(TasksClient.parseEnvValue(env, key: "MISSING") == nil, "an absent key reads as nil")
+
+    check(TasksClient.looksLikeAuthFailure("Error: invalid_grant"), "an auth-shaped gws failure is recognised")
+    check(!TasksClient.looksLikeAuthFailure("Error: ENOTFOUND"), "a network failure is not an auth problem")
+    check(TasksClient.looksLikeAuthFailure("{code: 403, reason: insufficientPermissions}"),
+          "a missing OAuth scope reads as an auth problem, not a transient one")
+
+    checkEqual(TasksClient.nodeVersionOrder("v24.12.0"), [24, 12, 0], "an nvm directory parses to its components")
+    check(TasksClient.nodeVersionOrder("v9.0.0")
+            .lexicographicallyPrecedes(TasksClient.nodeVersionOrder("v24.12.0")),
+          "v24 outranks v9 — a lexical sort of the raw names would get this backwards")
+    checkEqual(TasksClient.nodeVersionOrder("not-a-version"), [], "a junk directory name sorts last, not crashes")
+
+    check(CoachError.tasksNotConfigured("x").isAuthProblem, "a missing sheet is not retried in a loop")
+    check(CoachError.tasksUnavailable("x").isTransient, "an unreadable sheet is retried")
+    checkEqual(CoachError.tasksNotConfigured("x").fixAction, CoachError.FixAction.tasksSettings,
+               "the modal points at Settings, not a Hawk sign-in")
+    checkEqual(CoachError.notAuthenticated("x").fixAction, CoachError.FixAction.hawkSignIn,
+               "Hawk errors still offer a Hawk sign-in")
+}
+
+section("PromptPolicy: weekends are quiet unless there's work happening")
+do {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "America/New_York")!
+    func day(_ iso: String) -> Date {
+        let f = ISO8601DateFormatter()
+        f.timeZone = cal.timeZone
+        return f.date(from: iso)!
+    }
+    let saturday = day("2026-08-08T11:00:00-04:00")
+    let monday = day("2026-08-10T11:00:00-04:00")
+
+    check(cal.isDateInWeekend(saturday), "sanity: the fixture Saturday is a weekend")
+    check(!cal.isDateInWeekend(monday), "sanity: the fixture Monday is not")
+
+    check(PromptPolicy.allowStartOfDayPrompt(now: monday, quietWeekends: true, calendar: cal),
+          "weekday start-of-day prompt still fires")
+    check(!PromptPolicy.allowStartOfDayPrompt(now: saturday, quietWeekends: true, calendar: cal),
+          "weekend start-of-day prompt is suppressed")
+    check(PromptPolicy.allowStartOfDayPrompt(now: saturday, quietWeekends: false, calendar: cal),
+          "turning quiet weekends off restores it")
+
+    check(PromptPolicy.allowIntradayPrompt(now: monday, inPomodoro: false, userPresent: false,
+                                           quietWeekends: true, calendar: cal),
+          "weekday check-ins fire regardless of presence")
+    check(!PromptPolicy.allowIntradayPrompt(now: saturday, inPomodoro: false, userPresent: false,
+                                            quietWeekends: true, calendar: cal),
+          "weekend check-in is dropped when away and not in a pomodoro")
+    check(PromptPolicy.allowIntradayPrompt(now: saturday, inPomodoro: true, userPresent: false,
+                                           quietWeekends: true, calendar: cal),
+          "a weekend pomodoro re-enables check-ins")
+    check(PromptPolicy.allowIntradayPrompt(now: saturday, inPomodoro: false, userPresent: true,
+                                           quietWeekends: true, calendar: cal),
+          "being at the Mac on a weekend re-enables check-ins")
+
+    check(!PromptPolicy.userIsPresent(idleSeconds: 0, screenLocked: true), "a locked screen means away")
+    check(!PromptPolicy.userIsPresent(idleSeconds: PromptPolicy.activityWindow + 1, screenLocked: false),
+          "no input for longer than the window means away")
+    check(PromptPolicy.userIsPresent(idleSeconds: 5, screenLocked: false), "recent input means present")
 }
 
 // MARK: - Summary

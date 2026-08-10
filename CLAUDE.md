@@ -38,12 +38,56 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
 - `responses.json` - Experience sampling responses
 - `pomodoro-sessions.json` - Pomodoro session history (`taskDescription` is now
   always empty — the per-pomodoro goal feature was removed)
-- `todoist-api-token.txt` - Todoist API token (set in Settings → Focus)
+- (no task credentials: the Google Sheet task list is reached via the `gws` CLI,
+  which owns its own auth. A leftover `todoist-api-token.txt` is dead.)
 - `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
 - `coach-errors.log` - one line per focus-coach diagnostic (auth/network/HTTP failures,
   retries, recoveries). Also mirrored to the unified log with an `[FocusCoach]` prefix.
   There is no longer an `anthropic-api-key.txt`; see "Focus coach auth" below.
 - `meeting-attention-log.jsonl` - one line per meeting-drift nudge (`context`, `linger_seconds`)
+
+## Weekend Quiet Mode
+
+`PromptPolicy` (pure, unit-tested) gates the two self-report modals. With
+`weekendQuietMode` on (default; Settings → Sampling):
+
+- the start-of-day "How excited are you to work today?" prompt never fires on a
+  Saturday/Sunday — a pomodoro can still be started from the menu;
+- random intraday check-ins fire on a weekend only when a pomodoro is running
+  **or** the user is present (screen unlocked and HID input within
+  `PromptPolicy.activityWindow`, 5 min).
+
+A suppressed weekend check-in is *dropped*, not snoozed. That's deliberate:
+snoozing re-arms the prompt every 5 minutes, which is how an unattended weekend
+used to build a stack of modals waiting on Monday.
+
+## Calendar
+
+`CalendarMonitor` reads today's primary-calendar events through the same `gws`
+CLI as the task list (`TasksClient.runGws`), so both share one Google auth and
+one binary lookup. Events drive meeting detection, meeting-aware pomodoro
+capping, and auto-opening a Meet link 60s before a call.
+
+**This needs the `calendar` OAuth scope**, which `gws auth login` does *not*
+grant by default. Re-grant without dropping the scopes the coach needs:
+
+```bash
+gws auth login --services drive,gmail,sheets,docs,calendar
+```
+
+A missing scope comes back as HTTP 403 `insufficientPermissions` **in the
+response body with a zero exit code**, so it's caught from `json["error"]`, not
+the exit status. Two traps:
+
+- gws caches the access token in `~/.config/gws/token_cache.json`, and that cache
+  **outlives a re-login** — after adding a scope you may need to delete it, or
+  calls keep 403ing with the old token even though `gws auth status` shows the
+  new scope.
+- Calendar failures used to be silent (`refresh()` just `return`ed), and an empty
+  calendar is indistinguishable from a broken one: no nudges, no capping, no
+  Meet links, no trace. Failures now go to `coach-errors.log` via
+  `CoachLog.record(_:context:)`, logged once per error kind with a matching
+  "calendar recovered" line.
 
 ## Meeting Attention
 
@@ -69,16 +113,42 @@ methods so it's unit-tested headlessly (see `run-tests.sh`). Settings → Meetin
 tab toggles it and edits the threshold/allowlist; window-title reads need
 Accessibility permission (without it the browser never counts as a drift).
 
-## Focus Coach & Todoist
+## Focus Coach & the task list
 
 The focus coach no longer uses a manually-set pomodoro goal. Instead, on every
-focus check it fetches the user's **top Todoist to-do for today** (lowest
-`day_order` among incomplete tasks due on or before today — overdue included) via
-the Todoist Sync API (`POST /api/v1/sync`, `resource_types=["items"]`) and keeps
-the user on that. This is the same `day_order` field the `tbroadley/status-dashboard`
-app persists when you reorder todos, so the two stay in sync through Todoist itself
-(no direct coupling). When there is no to-do for today, the coach prompts the user
-to create one and can add it via the `create_todo` tool (`POST /api/v1/tasks`).
+focus check it fetches the user's **top to-do for today** — lowest `order` among
+incomplete tasks due on or before today (overdue included) — and keeps the user
+on that. When there is no to-do for today, the coach prompts the user to create
+one and can add it via the `create_todo` tool.
+
+The task list is a **Google Sheet**, read through the `gws` CLI (`TasksClient`).
+It replaced Todoist in Aug 2026, following `tbroadley/status-dashboard`, which
+made the same switch in its `clients/sheets.py` — this app deliberately mirrors
+that module's semantics so the two share one list with no direct coupling.
+Reorder in the dashboard and the coach follows.
+
+- Sheet layout, row 1 a header:
+  `A id | B content | C project | D description | E due | F recurrence | G order | H done | I completed_at`
+- `gws` owns the Google auth, so there is **no token on disk** for this app.
+  (The old `todoist-api-token.txt` is dead; safe to delete.)
+- The sheet ID is **not hardcoded** — this repo is public. It comes from
+  `defaults write org.metr.ExperienceSampling tasksSpreadsheetId <id>`, falling
+  back to `TASKS_SPREADSHEET_ID` in `~/.config/status-dashboard/.env`, which
+  status-dashboard already maintains. Editable in Settings → Focus.
+- `gws` is found by absolute path (a GUI app has a bare `PATH`), including a scan
+  of `~/.nvm/versions/node/*/bin` since nvm moves it on every Node upgrade;
+  override with `defaults write org.metr.ExperienceSampling gwsPath`.
+- Completing a **recurring** task rolls its due date forward instead of setting
+  `done`, so recurring work never shows up in "completed today".
+
+**Task-list failures are loud too.** No to-do means no check at all, so a dead
+token silently killed the whole coach for days (it looked identical to a coach
+with nothing to say — the exact failure mode this design exists to prevent).
+`TopTodo.unavailable` now carries a `CoachError` — `tasksNotConfigured` /
+`tasksAuthRequired` (gws can't reach Google) / `tasksUnavailable` (gws missing,
+API error, unparseable) — into the same log + modal + menu-bar path as the Claude
+errors. `CoachError.fixAction` picks the modal's button: Hawk errors get "Sign in
+to Hawk", a missing sheet gets "Open Settings".
 
 The Claude model used for both classification and coaching is configurable in
 Settings → Focus (`focusModel` in `UserDefaults`, defaults to
