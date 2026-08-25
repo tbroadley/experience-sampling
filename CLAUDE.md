@@ -150,6 +150,18 @@ API error, unparseable) — into the same log + modal + menu-bar path as the Cla
 errors. `CoachError.fixAction` picks the modal's button: Hawk errors get "Sign in
 to Hawk", a missing sheet gets "Open Settings".
 
+**Never-off-task screens.** `classifyUserPrompt` carries an explicit exception
+list to its own "be strict" rule, covering the screens that generated most of the
+false positives in `focus-log.jsonl`: sign-in/SSO pages (the cloud access portal,
+Workspace verification, MFA prompts), the status dashboard (which *is* the to-do
+list this coach reads), empty transitions ("New Tab"/"Untitled"/loading), live
+calls (Meet/Zoom/Teams/Slack huddles), and the calendar. Each entry says why it is
+instrumental, because a bare list of window titles doesn't generalise. The prompt
+also tells the model to judge the screen *before* one of these rather than
+treating it as a reset, so an SSO tab can't launder a real distraction. The list
+lives in the classifier prompt, not in a code-side allowlist, so follow-up checks
+(which share `classifyUserPrompt`) get it too.
+
 The Claude model used for both classification and coaching is configurable in
 Settings → Focus (`focusModel` in `UserDefaults`, defaults to
 `FocusMonitor.defaultModel` = `claude-sonnet-5`). `FocusMonitor.model` reads it

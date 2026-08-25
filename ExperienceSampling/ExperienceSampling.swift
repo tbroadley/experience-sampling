@@ -2420,6 +2420,21 @@ final class FocusMonitor {
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
         However, if the current screen matches something the user has endorsed as relevant, consider it on-task.
 
+        Never off-task — these are instrumental or unavoidable, and flagging them is a false positive. \
+        If the current screen is one of these, answer on_task: true with an empty message:
+          - Sign-in, SSO, and auth screens: the AWS access portal, AWS/Okta/Google Workspace login and \
+            verification pages, MFA prompts, "Verify with ..." pages. These are always a step toward some \
+            other task, and the user is often just waiting on a redirect or a push notification.
+          - The status dashboard (e.g. "Ghostty — status-dashboard"): that is the user's own to-do list — the \
+            same list this to-do came from. Reading or reordering it is never a distraction.
+          - Empty transition states: "New Tab", "Untitled", blank or still-loading pages. These last a moment \
+            while the user types a URL and carry no signal about what they are doing.
+          - Meetings and calls: Google Meet, Zoom, Teams, Slack huddles, and any window whose title marks a \
+            live call. The user cannot leave a meeting to work on a to-do, so never tell them to wrap it up.
+          - The calendar (e.g. "METR - Calendar - Week of ..."): checking or scheduling is ordinary work.
+        Judge the screen the user was on BEFORE one of these, not the screen itself; if that earlier screen was \
+        off-task and they are still away from their to-do afterwards, you can pick the thread back up then.
+
         Important: the screen-activity timeline is annotated with the top to-do that was active at each \
         point ("top to-do at this point: ..."). The top to-do can change during a single pomodoro as the \
         user finishes tasks and rolls onto the next. Judge each block of past activity against the to-do that \
