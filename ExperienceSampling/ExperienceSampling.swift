@@ -1821,11 +1821,16 @@ enum MiddlemanClient {
 
     /// One Messages API round trip, with token refresh and retries folded in.
     /// The success value is the decoded top-level response object.
+    ///
+    /// `maxTokens` covers thinking *and* text: Sonnet 5 spends 150-400 tokens
+    /// thinking before the first text block even on trivial prompts, so a budget
+    /// sized for the visible answer alone gets eaten entirely by thinking and the
+    /// response comes back with no text block at all. Keep it generously large.
     static func sendMessages(model: String,
                              systemPrompt: String,
                              messages: [[String: Any]],
                              tools: [[String: Any]] = [],
-                             maxTokens: Int = 300,
+                             maxTokens: Int = 2000,
                              completion: @escaping (Result<[String: Any], CoachError>) -> Void) {
         var body: [String: Any] = [
             "model": model,
@@ -2533,7 +2538,14 @@ final class FocusMonitor {
             case .success(let json):
                 guard let content = json["content"] as? [[String: Any]],
                       let text = content.compactMap({ $0["text"] as? String }).first else {
-                    self.reportCoachError(.badResponse("classification response had no text block"), context: "focus classification")
+                    // stop_reason is the tell: `max_tokens` means the budget was
+                    // spent on the thinking block before any text was emitted.
+                    let stopReason = json["stop_reason"] as? String ?? "nil"
+                    let blocks = (json["content"] as? [[String: Any]])?.compactMap { $0["type"] as? String } ?? []
+                    self.reportCoachError(
+                        .badResponse("classification response had no text block "
+                                     + "(stop_reason \(stopReason), blocks [\(blocks.joined(separator: ", "))])"),
+                        context: "focus classification")
                     completion(nil)
                     return
                 }
@@ -3160,7 +3172,7 @@ struct SettingsView: View {
         MiddlemanClient.sendMessages(model: model.isEmpty ? FocusMonitor.defaultModel : model,
                                      systemPrompt: "Reply with the single word OK.",
                                      messages: [["role": "user", "content": "ping"]],
-                                     maxTokens: 64) { result in
+                                     maxTokens: 512) { result in
             DispatchQueue.main.async {
                 isCheckingClaude = false
                 switch result {
@@ -3734,13 +3746,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOr(FocusMonitor.defaultModel)
             ?? FocusMonitor.defaultModel
         CoachLog.record("connection check starting (model \(model), \(MiddlemanClient.messagesURL?.absoluteString ?? "<no proxy configured>"))")
-        // 64 rather than a handful: Sonnet 5 emits a (usually empty) thinking
-        // block first, and too small a budget gets spent entirely on it, so the
-        // probe comes back with no text and looks like a failure when it isn't.
+        // 512 rather than a handful: Sonnet 5 emits a thinking block first, and it
+        // routinely runs to a couple hundred tokens even for "ping". Too small a
+        // budget gets spent entirely on it, so the probe comes back with no text
+        // and looks like a failure when it isn't.
         MiddlemanClient.sendMessages(model: model,
                                      systemPrompt: "Reply with the single word OK.",
                                      messages: [["role": "user", "content": "ping"]],
-                                     maxTokens: 64) { [weak self] result in
+                                     maxTokens: 512) { [weak self] result in
             DispatchQueue.main.async {
                 switch result {
                 case .success(let json):

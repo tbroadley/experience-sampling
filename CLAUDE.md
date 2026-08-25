@@ -212,10 +212,15 @@ a model Middleman lists but isn't entitled to (→ `modelNotEntitled`), or set
 `defaults write org.metr.ExperienceSampling middlemanBaseURL <unreachable-host>`
 (→ `networkUnavailable` plus the backoff path).
 
-Note on `max_tokens`: Sonnet 5 emits a (usually empty) `thinking` block first, so
-a tiny budget gets spent entirely on it and the response comes back with no text.
-Both call sites read the *first text block* rather than `content.first`, so a
-leading thinking block no longer reads as a failure.
+Note on `max_tokens`: it is a budget for thinking **and** text. Sonnet 5 emits a
+`thinking` block first, and it routinely runs 150-400 tokens even for "ping"; if
+the budget runs out inside it, the reply comes back `stop_reason: max_tokens`
+with a thinking block and no text at all. That was the cause of the intermittent
+"classification response had no text block" errors — the default was 300, and a
+real classification prompt regularly thought past it. The default is now 2000 and
+the connection probes use 512. Both call sites read the *first text block* rather
+than `content.first`, so a leading thinking block isn't itself a failure, and the
+classify error detail now includes `stop_reason` and the block types.
 
 ## Gotchas
 
