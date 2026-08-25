@@ -170,6 +170,50 @@ final class PomodoroDataStore {
     }
 }
 
+// MARK: - Prompt Policy
+
+/// When self-report modals are allowed to appear.
+///
+/// Weekends are quiet by default: the "Good morning — how excited are you to
+/// work today?" prompt never fires, and the random intraday check-ins only fire
+/// when there's evidence the user is actually working — a running pomodoro, or
+/// simply being at the Mac (unlocked, with input in the last few minutes).
+/// Without that gate a weekend of scheduled prompts fires into an empty room and
+/// stacks up: each unanswered modal re-arms a snooze, so they pile on top of each
+/// other by the time the user comes back.
+enum PromptPolicy {
+    /// Seconds of no keyboard/mouse input after which the user counts as away.
+    static let activityWindow: TimeInterval = 5 * 60
+
+    static var weekendQuietMode: Bool {
+        (UserDefaults.standard.object(forKey: "weekendQuietMode") as? Bool) ?? true
+    }
+
+    /// True when the user is plausibly at the Mac right now.
+    static func userIsPresent(idleSeconds: TimeInterval? = nil, screenLocked: Bool? = nil) -> Bool {
+        if screenLocked ?? BreakCaffeinator.systemScreenLocked() { return false }
+        let idle = idleSeconds ?? CGEventSource.secondsSinceLastEventType(
+            .hidSystemState, eventType: CGEventType(rawValue: ~0)!
+        )
+        return idle < activityWindow
+    }
+
+    /// Whether the start-of-day prompt may fire. Weekends get no "how excited are
+    /// you to work today?" — the honest answer is "I'm not working today".
+    static func allowStartOfDayPrompt(now: Date, quietWeekends: Bool, calendar: Calendar = .current) -> Bool {
+        !(quietWeekends && calendar.isDateInWeekend(now))
+    }
+
+    /// Whether a random intraday check-in may fire. On a weekend it needs a sign
+    /// of actual work: a pomodoro in progress, or the user present at the Mac.
+    static func allowIntradayPrompt(
+        now: Date, inPomodoro: Bool, userPresent: Bool, quietWeekends: Bool, calendar: Calendar = .current
+    ) -> Bool {
+        guard quietWeekends, calendar.isDateInWeekend(now) else { return true }
+        return inPomodoro || userPresent
+    }
+}
+
 // MARK: - Prompt Scheduler
 
 final class PromptScheduler: ObservableObject {
@@ -375,7 +419,7 @@ final class PomodoroScheduler: ObservableObject {
         phaseStartDate = Date()
 
         // The per-pomodoro goal is gone; the focus coach now tracks the top
-        // Todoist to-do live, so sessions are recorded without a fixed task.
+        // to-do live, so sessions are recorded without a fixed task.
         PomodoroDataStore.shared.add(PomodoroSession(
             startTime: Date(),
             taskDescription: "",
@@ -517,6 +561,11 @@ final class WakeDetector {
 
         // Only show "Good morning" prompts before noon
         guard hour < 12 else { return }
+        // ...and never on a weekend, where "how excited are you to work today?"
+        // is the wrong question. A pomodoro can still be started from the menu.
+        guard PromptPolicy.allowStartOfDayPrompt(
+            now: Date(), quietWeekends: PromptPolicy.weekendQuietMode, calendar: calendar
+        ) else { return }
 
         let lastPomodoroDate = UserDefaults.standard.object(forKey: lastPomodoroPromptDateKey) as? Date
         let lastPomodoroDay = lastPomodoroDate.map { calendar.startOfDay(for: $0) }
@@ -694,6 +743,7 @@ final class CalendarMonitor {
     private var avInactiveCount = 0
     private var earlyExitMeetings: Set<String> = []
     private var avCheckTimer: Timer?
+    private var lastCalendarErrorKind: String?
     private let refreshInterval: TimeInterval = 5 * 60
     private let meetOpenBuffer: TimeInterval = 60
     private let avChecksBeforeEarlyExit = 2
@@ -868,28 +918,34 @@ final class CalendarMonitor {
             let now = Date()
             let endOfDay = Calendar.current.date(bySettingHour: 23, minute: 59, second: 59, of: now)!
 
-            let process = Process()
-            let gws = Self.findGws()
-            process.executableURL = URL(fileURLWithPath: gws)
-            process.arguments = [
-                "calendar", "events", "list",
-                "--params", """
-                {"calendarId":"primary","timeMin":"\(formatter.string(from: now))","timeMax":"\(formatter.string(from: endOfDay))","singleEvents":true,"orderBy":"startTime","maxResults":"20"}
-                """
+            let params: [String: Any] = [
+                "calendarId": "primary",
+                "timeMin": formatter.string(from: now),
+                "timeMax": formatter.string(from: endOfDay),
+                "singleEvents": true,
+                "orderBy": "startTime",
+                "maxResults": "20"
             ]
+            guard let encoded = try? JSONSerialization.data(withJSONObject: params),
+                  let paramString = String(data: encoded, encoding: .utf8) else { return }
 
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-            } catch { return }
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let items = json["items"] as? [[String: Any]] else { return }
+            let json: [String: Any]
+            switch TasksClient.runGws(["calendar", "events", "list", "--params", paramString]) {
+            case .success(let payload):
+                json = payload
+            case .failure(let error):
+                // Never silent. An empty calendar and a broken one look identical
+                // from the outside — both stop meeting nudges, meeting-aware
+                // pomodoro capping, and Meet-link auto-open — and a missing OAuth
+                // scope once killed all three for days without a trace.
+                self.reportCalendarFailure(error)
+                return
+            }
+            guard let items = json["items"] as? [[String: Any]] else {
+                self.reportCalendarFailure(.tasksUnavailable("calendar reply had no `items` array"))
+                return
+            }
+            self.reportCalendarSuccess()
 
             let parsed: [CalendarEvent] = items.compactMap { item in
                 guard let startObj = item["start"] as? [String: String],
@@ -945,16 +1001,24 @@ final class CalendarMonitor {
         }
     }
 
-    private static func findGws() -> String {
-        let candidates = [
-            "/Users/thomas/.nvm/versions/node/v24.12.0/bin/gws",
-            "/usr/local/bin/gws",
-            "/opt/homebrew/bin/gws"
-        ]
-        for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
-            return c
+    /// Logs a calendar read failure once per kind — the refresh timer fires every
+    /// 5 minutes, and a sustained outage shouldn't bury the log.
+    private func reportCalendarFailure(_ error: CoachError) {
+        // Hops to main because `refresh` runs on a concurrent queue and this
+        // state, like `events`, is only ever touched there.
+        DispatchQueue.main.async {
+            guard self.lastCalendarErrorKind != error.kind else { return }
+            self.lastCalendarErrorKind = error.kind
+            CoachLog.record(error, context: "calendar refresh")
         }
-        return "/usr/local/bin/gws"
+    }
+
+    private func reportCalendarSuccess() {
+        DispatchQueue.main.async {
+            guard self.lastCalendarErrorKind != nil else { return }
+            CoachLog.record("calendar recovered — a refresh succeeded after earlier failures")
+            self.lastCalendarErrorKind = nil
+        }
     }
 }
 
@@ -978,143 +1042,311 @@ struct ScreenObservation {
     let topTodo: String
 }
 
-// MARK: - Todoist
+// MARK: - Tasks (Google Sheet)
 
-struct TodoistTask {
+struct TaskItem {
     let id: String
     let content: String
     let dayOrder: Int
 }
 
-struct TodoistCompletedTask {
+struct CompletedTaskItem {
     let content: String
     let completedAt: Date
 }
 
 enum TopTodo {
-    case todo(TodoistTask)
-    case none         // token works, but no qualifying to-do for today
-    case unavailable  // no token, or the fetch failed — don't nag about it
+    case todo(TaskItem)
+    case none  // the sheet is readable, but has no qualifying to-do for today
+    /// Not configured, or the read failed. Carries the reason so the failure is
+    /// loud: a broken task source stops every focus check, and silence there is
+    /// indistinguishable from a coach that simply has nothing to say.
+    case unavailable(CoachError)
 }
 
-// Reads today's top to-do from Todoist, the same source status-dashboard writes
-// its ordering to: reordering there persists to the `day_order` field via the
-// Sync API, so the lowest day_order among today's incomplete tasks is "the top".
-enum TodoistClient {
-    static var tokenFileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport.appendingPathComponent("ExperienceSampling/todoist-api-token.txt")
+/// Reads today's top to-do from the Google Sheet that `tbroadley/status-dashboard`
+/// keeps its task list in (it replaced Todoist there in Aug 2026). Reordering in
+/// the dashboard writes the `order` column, so the two stay in sync through the
+/// sheet itself — no direct coupling.
+///
+/// Access goes through the `gws` CLI, the same way `CalendarMonitor` reads the
+/// calendar and the way status-dashboard's own client works: `gws` owns the
+/// Google auth, so there is no token for this app to hold.
+///
+/// Sheet layout (row 1 is a header, one task per row):
+///
+///     A id | B content | C project | D description | E due
+///     F recurrence | G order | H done | I completed_at
+enum TasksClient {
+    static let sheetName = "Tasks"
+    static let dataRange = "Tasks!A2:I"
+
+    private enum Column {
+        static let id = 0, content = 1, due = 4, order = 6, done = 7, completedAt = 8
     }
 
-    static func readToken() -> String? {
-        guard let token = try? String(contentsOf: tokenFileURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else { return nil }
-        return token
+    /// The spreadsheet to read. Deliberately not defaulted in source — this repo
+    /// is public and the sheet ID isn't. Set it with `defaults write
+    /// org.metr.ExperienceSampling tasksSpreadsheetId <id>`, or leave it to the
+    /// `TASKS_SPREADSHEET_ID` line in `~/.config/status-dashboard/.env`, which
+    /// status-dashboard already maintains.
+    static var spreadsheetID: String? {
+        let stored = UserDefaults.standard.string(forKey: "tasksSpreadsheetId")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let stored, !stored.isEmpty { return stored }
+        return dashboardEnvSpreadsheetID()
     }
 
-    // Mirrors status-dashboard's get_tasks_for_date(today): incomplete, not
-    // deleted, with a due date on or before today (overdue included), ordered by
-    // day_order ascending.
+    static var dashboardEnvURL: URL {
+        URL(fileURLWithPath: "\(NSHomeDirectory())/.config/status-dashboard/.env")
+    }
+
+    static func dashboardEnvSpreadsheetID() -> String? {
+        guard let text = try? String(contentsOf: dashboardEnvURL, encoding: .utf8) else { return nil }
+        return parseEnvValue(text, key: "TASKS_SPREADSHEET_ID")
+    }
+
+    /// Minimal `KEY=value` reader — enough for the one line we need, tolerating
+    /// comments, blank lines, `export ` prefixes and quoted values.
+    static func parseEnvValue(_ text: String, key: String) -> String? {
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            var line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#") { continue }
+            if line.hasPrefix("export ") { line = String(line.dropFirst("export ".count)) }
+            guard let eq = line.firstIndex(of: "="),
+                  line[line.startIndex..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
+            let value = line[line.index(after: eq)...]
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    // MARK: gws plumbing
+
+    /// Where to look for gws. A GUI app inherits a bare PATH, so absolute paths
+    /// are required; the nvm install moves with every Node upgrade, hence the
+    /// glob over version directories. Override with `defaults write
+    /// org.metr.ExperienceSampling gwsPath /path/to/gws`.
+    static func findGws() -> String? {
+        if let override = UserDefaults.standard.string(forKey: "gwsPath"), !override.isEmpty {
+            return FileManager.default.isExecutableFile(atPath: override) ? override : nil
+        }
+        var candidates = ["\(NSHomeDirectory())/.local/bin/gws", "/opt/homebrew/bin/gws", "/usr/local/bin/gws"]
+        let nvm = "\(NSHomeDirectory())/.nvm/versions/node"
+        let versions = (try? FileManager.default.contentsOfDirectory(atPath: nvm)) ?? []
+        // Newest version first, compared numerically: a lexical sort ranks "v9"
+        // above "v24", which would pin us to an ancient Node after an upgrade.
+        candidates += versions
+            .sorted { nodeVersionOrder($1).lexicographicallyPrecedes(nodeVersionOrder($0)) }
+            .map { "\(nvm)/\($0)/bin/gws" }
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    /// `"v24.12.0"` → `[24, 12, 0]`, for ordering nvm's version directories.
+    static func nodeVersionOrder(_ name: String) -> [Int] {
+        name.drop { !$0.isNumber }.split(separator: ".").map { Int($0) ?? 0 }
+    }
+
+    /// Runs `gws` and parses its stdout as JSON. Every failure is a `CoachError`
+    /// rather than a nil, so callers can't quietly treat "broken" as "nothing here".
+    static func runGws(_ arguments: [String], body: [String: Any]? = nil) -> Result<[String: Any], CoachError> {
+        guard let gws = findGws() else {
+            return .failure(.tasksUnavailable("gws CLI not found; set `defaults write org.metr.ExperienceSampling gwsPath`"))
+        }
+
+        var arguments = arguments
+        if let body {
+            // gws takes the request body as a --json argument, not on stdin.
+            guard let encoded = try? JSONSerialization.data(withJSONObject: body),
+                  let text = String(data: encoded, encoding: .utf8) else {
+                return .failure(.tasksUnavailable("could not encode the request body"))
+            }
+            arguments += ["--json", text]
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: gws)
+        process.arguments = arguments
+        let out = Pipe(), err = Pipe()
+        process.standardOutput = out
+        process.standardError = err
+        do { try process.run() } catch {
+            return .failure(.tasksUnavailable("gws failed to launch: \(error.localizedDescription)"))
+        }
+
+        // Drain before waiting: a full pipe buffer would deadlock the child.
+        let stdout = out.fileHandleForReading.readDataToEndOfFile()
+        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let detail = "gws \(arguments.first ?? "") exited \(process.terminationStatus): \(stderr.prefix(300))"
+            return .failure(looksLikeAuthFailure(stderr) ? .tasksAuthRequired(detail) : .tasksUnavailable(detail))
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any] else {
+            return .failure(.tasksUnavailable("gws returned unparseable output: \(String(data: stdout.prefix(200), encoding: .utf8) ?? "")"))
+        }
+        if let apiError = json["error"] {
+            // A missing OAuth scope lands here as a 403 `insufficientPermissions`
+            // with a zero exit code, so it must be caught from the body, not the
+            // exit status. `gws auth login --services ...` re-grants; note that
+            // gws keeps a token cache that outlives the new grant, so a stale
+            // ~/.config/gws/token_cache.json can keep 403ing after a re-login.
+            let text = String(describing: apiError)
+            let detail = "gws API error: \(text.prefix(300))"
+            return .failure(looksLikeAuthFailure(text) ? .tasksAuthRequired(detail) : .tasksUnavailable(detail))
+        }
+        return .success(json)
+    }
+
+    static func looksLikeAuthFailure(_ stderr: String) -> Bool {
+        let lowered = stderr.lowercased()
+        return ["unauthorized", "invalid_grant", "credential", "not authenticated",
+                "no token", "login", "401", "403"].contains { lowered.contains($0) }
+    }
+
+    /// The whole `Tasks` sheet as rows, padded so short rows (Sheets omits
+    /// trailing empties) can be indexed without a bounds check.
+    static func loadRows() -> Result<[[String]], CoachError> {
+        guard let spreadsheetID else {
+            return .failure(.tasksNotConfigured("no spreadsheet ID in defaults or \(dashboardEnvURL.path)"))
+        }
+        let params = ["spreadsheetId": spreadsheetID, "range": dataRange]
+        guard let encoded = try? JSONSerialization.data(withJSONObject: params),
+              let paramString = String(data: encoded, encoding: .utf8) else {
+            return .failure(.tasksUnavailable("could not encode the values.get params"))
+        }
+        return runGws(["sheets", "spreadsheets", "values", "get", "--params", paramString]).flatMap { json in
+            guard let values = json["values"] as? [[String]] else {
+                // An empty sheet legitimately omits "values" entirely.
+                return .success([])
+            }
+            return .success(values.map { row in
+                row.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    + Array(repeating: "", count: max(0, columnCount - row.count))
+            })
+        }
+    }
+
+    private static let columnCount = 9
+
+    // MARK: Reads
+
+    /// Mirrors status-dashboard's `get_tasks_for_date(today)`: not done, with a
+    /// due date on or before today (overdue included), lowest `order` wins.
+    static func topTodo(rows: [[String]], today: String) -> TaskItem? {
+        let candidates: [TaskItem] = rows.compactMap { row in
+            let id = row[Column.id]
+            guard !id.isEmpty, !isTrue(row[Column.done]) else { return nil }
+            let due = String(row[Column.due].prefix(10))
+            guard !due.isEmpty, due <= today else { return nil }
+            return TaskItem(id: id, content: row[Column.content], dayOrder: Int(row[Column.order]) ?? 0)
+        }
+        return candidates.min { $0.dayOrder < $1.dayOrder }
+    }
+
+    /// Tasks ticked off today, most recent first. A recurring task rolls its due
+    /// date forward instead of being marked done, so it never appears here —
+    /// same as in status-dashboard.
+    static func completedToday(rows: [[String]], today: String) -> [CompletedTaskItem] {
+        rows.compactMap { row in
+            guard isTrue(row[Column.done]) else { return nil }
+            let stamp = row[Column.completedAt]
+            guard String(stamp.prefix(10)) == today, let date = parseSheetDate(stamp) else { return nil }
+            return CompletedTaskItem(content: row[Column.content], completedAt: date)
+        }.sorted { $0.completedAt > $1.completedAt }
+    }
+
     static func fetchTopTodo(completion: @escaping (TopTodo) -> Void) {
-        guard let token = readToken() else { completion(.unavailable); return }
-
-        var request = URLRequest(url: URL(string: "https://api.todoist.com/api/v1/sync")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        // resource_types=["items"], percent-encoded.
-        request.httpBody = Data("sync_token=*&resource_types=%5B%22items%22%5D".utf8)
-        request.timeoutInterval = 15
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let data, error == nil,
-                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let items = json["items"] as? [[String: Any]] else {
-                completion(.unavailable)
-                return
+        DispatchQueue.global(qos: .utility).async {
+            switch loadRows() {
+            case .failure(let error):
+                completion(.unavailable(error))
+            case .success(let rows):
+                guard let top = topTodo(rows: rows, today: todayString()) else {
+                    completion(.none)
+                    return
+                }
+                completion(.todo(top))
             }
-
-            let today = todayString()
-            let candidates: [TodoistTask] = items.compactMap { item in
-                if (item["checked"] as? Bool ?? false) || (item["is_deleted"] as? Bool ?? false) { return nil }
-                guard let due = item["due"] as? [String: Any],
-                      let dueRaw = due["date"] as? String, !dueRaw.isEmpty else { return nil }
-                guard String(dueRaw.prefix(10)) <= today else { return nil }
-                guard let id = item["id"] as? String, let content = item["content"] as? String else { return nil }
-                return TodoistTask(id: id, content: content, dayOrder: item["day_order"] as? Int ?? 0)
-            }
-
-            guard let top = candidates.min(by: { $0.dayOrder < $1.dayOrder }) else {
-                completion(.none)
-                return
-            }
-            completion(.todo(top))
-        }.resume()
+        }
     }
 
-    // Today's completed to-dos (most recent first). Used to tell the focus coach
-    // that time already spent on a finished to-do is a success, not a distraction —
-    // so it doesn't scold the user for e.g. an hour on Slack that *was* the
-    // (now-completed) "catch up on Slack" to-do. Failures return [] silently.
-    static func fetchCompletedTodosToday(completion: @escaping ([TodoistCompletedTask]) -> Void) {
-        guard let token = readToken() else { completion([]); return }
-
-        let startOfDay = Calendar(identifier: .gregorian).startOfDay(for: Date())
-        let stamp = ISO8601DateFormatter()
-        stamp.formatOptions = [.withInternetDateTime]
-
-        var comps = URLComponents(string: "https://api.todoist.com/api/v1/tasks/completed/by_completion_date")!
-        comps.queryItems = [
-            URLQueryItem(name: "since", value: stamp.string(from: startOfDay)),
-            URLQueryItem(name: "until", value: stamp.string(from: Date()))
-        ]
-        var request = URLRequest(url: comps.url!)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 15
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let data, error == nil,
-                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let items = json["items"] as? [[String: Any]] else {
+    static func fetchCompletedTodosToday(completion: @escaping ([CompletedTaskItem]) -> Void) {
+        DispatchQueue.global(qos: .utility).async {
+            switch loadRows() {
+            case .failure:
+                // Best-effort context for the coach; the top-to-do read above has
+                // already reported anything that's actually broken.
                 completion([])
-                return
+            case .success(let rows):
+                completion(completedToday(rows: rows, today: todayString()))
             }
+        }
+    }
 
-            let parser = ISO8601DateFormatter()
-            parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let tasks: [TodoistCompletedTask] = items.compactMap { item in
-                guard let content = item["content"] as? String,
-                      let completedRaw = item["completed_at"] as? String,
-                      let completedAt = parser.date(from: completedRaw) else { return nil }
-                return TodoistCompletedTask(content: content, completedAt: completedAt)
-            }
-            completion(tasks.sorted { $0.completedAt > $1.completedAt })
-        }.resume()
+    // MARK: Writes
+
+    /// Appends a task due today, matching status-dashboard's `create_task`.
+    static func newTaskRow(content: String, id: String, today: String) -> [String] {
+        [id, content, "", "", today, "", "0", "FALSE", ""]
     }
 
     static func createTask(content: String, completion: @escaping (Bool) -> Void) {
-        guard let token = readToken() else { completion(false); return }
-        var request = URLRequest(url: URL(string: "https://api.todoist.com/api/v1/tasks")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["content": content, "due_string": "today"])
-        request.timeoutInterval = 10
-        URLSession.shared.dataTask(with: request) { _, response, error in
-            let ok = error == nil && ((response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false)
-            completion(ok)
-        }.resume()
+        DispatchQueue.global(qos: .utility).async {
+            guard let spreadsheetID else { completion(false); return }
+            let params: [String: Any] = [
+                "spreadsheetId": spreadsheetID,
+                "range": "\(sheetName)!A:I",
+                "valueInputOption": "RAW",
+                "insertDataOption": "INSERT_ROWS"
+            ]
+            guard let encoded = try? JSONSerialization.data(withJSONObject: params),
+                  let paramString = String(data: encoded, encoding: .utf8) else {
+                completion(false)
+                return
+            }
+            let row = newTaskRow(content: content, id: UUID().uuidString, today: todayString())
+            let result = runGws(
+                ["sheets", "spreadsheets", "values", "append", "--params", paramString],
+                body: ["values": [row]]
+            )
+            if case .failure(let error) = result {
+                CoachLog.record(error, context: "create to-do")
+            }
+            completion((try? result.get()) != nil)
+        }
     }
 
-    private static func todayString() -> String {
+    // MARK: Helpers
+
+    static func isTrue(_ value: String) -> Bool {
+        value.trimmingCharacters(in: .whitespaces).uppercased() == "TRUE"
+    }
+
+    /// Parses the sheet's date/datetime strings: "2026-08-10" or an ISO datetime
+    /// with a local offset, which is what status-dashboard writes.
+    static func parseSheetDate(_ raw: String) -> Date? {
+        if raw.count == 10 { return dayFormatter.date(from: raw) }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: raw) { return date }
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return iso.date(from: raw)
+    }
+
+    private static let dayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.calendar = Calendar(identifier: .gregorian)
         f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
         f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: Date())
-    }
+        return f
+    }()
+
+    static func todayString() -> String { dayFormatter.string(from: Date()) }
 }
 
 // MARK: - Claude via METR's Middleman proxy
@@ -1145,6 +1377,13 @@ enum CoachError: Error, Equatable {
     /// No proxy base URL configured. Deliberately not defaulted in source — see
     /// `MiddlemanClient.baseURL`.
     case proxyNotConfigured(String)
+    /// No tasks spreadsheet configured. Without a top to-do there is nothing to
+    /// coach against, so this stops the coach just as dead as a missing token.
+    case tasksNotConfigured(String)
+    /// The `gws` CLI has no usable Google credentials.
+    case tasksAuthRequired(String)
+    /// gws missing, the Sheets call failed, or the reply didn't parse.
+    case tasksUnavailable(String)
 
     /// Stable short name, used as the throttle key and in log lines.
     var kind: String {
@@ -1157,6 +1396,21 @@ enum CoachError: Error, Equatable {
         case .httpError(let status, _): return "http-\(status)"
         case .badResponse: return "bad-response"
         case .proxyNotConfigured: return "proxy-not-configured"
+        case .tasksNotConfigured: return "tasks-not-configured"
+        case .tasksAuthRequired: return "tasks-auth-required"
+        case .tasksUnavailable: return "tasks-unavailable"
+        }
+    }
+
+    /// Which button the error modal should offer, if any.
+    enum FixAction { case none, hawkSignIn, tasksSettings }
+
+    var fixAction: FixAction {
+        switch self {
+        case .hawkMissing, .notAuthenticated, .tokenRejected: return .hawkSignIn
+        case .tasksNotConfigured: return .tasksSettings
+        case .tasksAuthRequired: return .none
+        default: return .none
         }
     }
 
@@ -1166,6 +1420,7 @@ enum CoachError: Error, Equatable {
     var isAuthProblem: Bool {
         switch self {
         case .hawkMissing, .notAuthenticated, .tokenRejected: return true
+        case .tasksNotConfigured, .tasksAuthRequired: return true
         default: return false
         }
     }
@@ -1173,7 +1428,7 @@ enum CoachError: Error, Equatable {
     /// True when trying again shortly might just work.
     var isTransient: Bool {
         switch self {
-        case .networkUnavailable: return true
+        case .networkUnavailable, .tasksUnavailable: return true
         case .httpError(let status, _): return status == 408 || status == 429 || status >= 500
         default: return false
         }
@@ -1190,6 +1445,9 @@ enum CoachError: Error, Equatable {
         case .httpError(let status, _): return "Focus coach: Middleman error \(status)"
         case .badResponse: return "Focus coach: unexpected reply"
         case .proxyNotConfigured: return "Focus coach: proxy not configured"
+        case .tasksNotConfigured: return "Focus coach: no task list configured"
+        case .tasksAuthRequired: return "Focus coach: Google sign-in needed"
+        case .tasksUnavailable: return "Focus coach: can't read the task sheet"
         }
     }
 
@@ -1218,6 +1476,17 @@ enum CoachError: Error, Equatable {
             HAWK_MIDDLEMAN_URL in ~/.config/hawk-cli/env; otherwise set one with \
             `defaults write org.metr.ExperienceSampling middlemanBaseURL <url>`.
             """
+        case .tasksNotConfigured:
+            return """
+            The coach keeps you on the top to-do in your tasks spreadsheet, so \
+            without one it can't check anything at all. Paste the sheet ID into \
+            Settings → Focus (status-dashboard's is in \
+            ~/.config/status-dashboard/.env).
+            """
+        case .tasksAuthRequired:
+            return "The gws CLI can't reach Google. Run `gws auth login` in a terminal; the coach picks it up on the next check."
+        case .tasksUnavailable:
+            return "Reading the tasks spreadsheet failed. The coach retries on the next check; see coach-errors.log for the detail."
         }
     }
 
@@ -1227,7 +1496,8 @@ enum CoachError: Error, Equatable {
         switch self {
         case .hawkMissing(let d), .notAuthenticated(let d), .tokenRejected(let d),
              .networkUnavailable(let d), .modelNotEntitled(let d), .badResponse(let d),
-             .proxyNotConfigured(let d):
+             .proxyNotConfigured(let d), .tasksNotConfigured(let d),
+             .tasksAuthRequired(let d), .tasksUnavailable(let d):
             return d
         case .httpError(_, let d):
             return d
@@ -1551,11 +1821,16 @@ enum MiddlemanClient {
 
     /// One Messages API round trip, with token refresh and retries folded in.
     /// The success value is the decoded top-level response object.
+    ///
+    /// `maxTokens` covers thinking *and* text: Sonnet 5 spends 150-400 tokens
+    /// thinking before the first text block even on trivial prompts, so a budget
+    /// sized for the visible answer alone gets eaten entirely by thinking and the
+    /// response comes back with no text block at all. Keep it generously large.
     static func sendMessages(model: String,
                              systemPrompt: String,
                              messages: [[String: Any]],
                              tools: [[String: Any]] = [],
-                             maxTokens: Int = 300,
+                             maxTokens: Int = 2000,
                              completion: @escaping (Result<[String: Any], CoachError>) -> Void) {
         var body: [String: Any] = [
             "model": model,
@@ -1692,11 +1967,11 @@ final class FocusMonitor {
         return (stored?.isEmpty == false ? stored! : Self.defaultModel)
     }
 
-    // The current top Todoist to-do, re-fetched on every check.
+    // The current top to-do from the tasks sheet, re-fetched on every check.
     private var currentTopTodo: String = ""
     // Today's completed to-dos, re-fetched on every check. Given to the coach so it
     // credits time already spent on finished work instead of scolding for it.
-    private var recentlyCompletedTodos: [TodoistCompletedTask] = []
+    private var recentlyCompletedTodos: [CompletedTaskItem] = []
     var onOffTaskDetected: ((String) -> Void)?
     // Fired when a check finds the user still off-task while the coach modal is
     // already open, so the coach can append a fresh nudge to the live conversation.
@@ -1887,7 +2162,7 @@ final class FocusMonitor {
 
     private var conversationTools: [[String: Any]] {
         [["name": "create_todo",
-          "description": "Add a new to-do to the user's Todoist list for today. Use this when the user tells you what they want to work on so it becomes part of their list.",
+          "description": "Add a new to-do to the user's task list for today. Use this when the user tells you what they want to work on so it becomes part of their list.",
           "input_schema": [
             "type": "object",
             "properties": ["content": ["type": "string", "description": "The to-do text"]],
@@ -2021,7 +2296,7 @@ final class FocusMonitor {
                 }
 
                 if toolName == "create_todo", let todo = input["content"] as? String {
-                    TodoistClient.createTask(content: todo) { ok in
+                    TasksClient.createTask(content: todo) { ok in
                         continueWith(ok ? "Added \"\(todo)\" to today's list." : "Failed to add the to-do — tell the user to add it manually.")
                     }
                 } else {
@@ -2077,14 +2352,17 @@ final class FocusMonitor {
         lastDetectedContext = context
         isChecking = true
 
-        TodoistClient.fetchTopTodo { [weak self] result in
+        TasksClient.fetchTopTodo { [weak self] result in
             guard let self else { return }
             switch result {
-            case .unavailable:
-                // No token or the fetch failed — keep the last known to-do so the
-                // timeline stays continuous, then skip this check silently.
+            case .unavailable(let error):
+                // No token or the fetch failed. Keep the last known to-do so the
+                // timeline stays continuous, but say so loudly — a dead task
+                // token stops every check, and silence here is indistinguishable
+                // from a coach that simply has nothing to say.
                 self.recordScreen(context, topTodo: self.currentTopTodo)
                 self.isChecking = false
+                self.reportCoachError(error, context: "top to-do")
             case .none:
                 self.currentTopTodo = ""
                 self.recordScreen(context, topTodo: "")
@@ -2095,7 +2373,7 @@ final class FocusMonitor {
                 self.currentTopTodo = todo.content
                 self.recordScreen(context, topTodo: todo.content)
                 DispatchQueue.main.async { self.onTopTodoChanged?(todo.content) }
-                TodoistClient.fetchCompletedTodosToday { [weak self] completed in
+                TasksClient.fetchCompletedTodosToday { [weak self] completed in
                     guard let self else { return }
                     self.recentlyCompletedTodos = completed
                     self.classify(context: context)
@@ -2141,6 +2419,21 @@ final class FocusMonitor {
         \nIs this on-task? Be strict — only on-task if clearly and directly related to the stated to-do.
         Slack, email, social media, news, and casual browsing are off-task even if tangentially related.
         However, if the current screen matches something the user has endorsed as relevant, consider it on-task.
+
+        Never off-task — these are instrumental or unavoidable, and flagging them is a false positive. \
+        If the current screen is one of these, answer on_task: true with an empty message:
+          - Sign-in, SSO, and auth screens: the AWS access portal, AWS/Okta/Google Workspace login and \
+            verification pages, MFA prompts, "Verify with ..." pages. These are always a step toward some \
+            other task, and the user is often just waiting on a redirect or a push notification.
+          - The status dashboard (e.g. "Ghostty — status-dashboard"): that is the user's own to-do list — the \
+            same list this to-do came from. Reading or reordering it is never a distraction.
+          - Empty transition states: "New Tab", "Untitled", blank or still-loading pages. These last a moment \
+            while the user types a URL and carry no signal about what they are doing.
+          - Meetings and calls: Google Meet, Zoom, Teams, Slack huddles, and any window whose title marks a \
+            live call. The user cannot leave a meeting to work on a to-do, so never tell them to wrap it up.
+          - The calendar (e.g. "METR - Calendar - Week of ..."): checking or scheduling is ordinary work.
+        Judge the screen the user was on BEFORE one of these, not the screen itself; if that earlier screen was \
+        off-task and they are still away from their to-do afterwards, you can pick the thread back up then.
 
         Important: the screen-activity timeline is annotated with the top to-do that was active at each \
         point ("top to-do at this point: ..."). The top to-do can change during a single pomodoro as the \
@@ -2260,7 +2553,14 @@ final class FocusMonitor {
             case .success(let json):
                 guard let content = json["content"] as? [[String: Any]],
                       let text = content.compactMap({ $0["text"] as? String }).first else {
-                    self.reportCoachError(.badResponse("classification response had no text block"), context: "focus classification")
+                    // stop_reason is the tell: `max_tokens` means the budget was
+                    // spent on the thinking block before any text was emitted.
+                    let stopReason = json["stop_reason"] as? String ?? "nil"
+                    let blocks = (json["content"] as? [[String: Any]])?.compactMap { $0["type"] as? String } ?? []
+                    self.reportCoachError(
+                        .badResponse("classification response had no text block "
+                                     + "(stop_reason \(stopReason), blocks [\(blocks.joined(separator: ", "))])"),
+                        context: "focus classification")
                     completion(nil)
                     return
                 }
@@ -2784,6 +3084,7 @@ struct SettingsView: View {
     @AppStorage("workingHoursStart") private var workStart = 9
     @AppStorage("workingHoursEnd") private var workEnd = 17
     @AppStorage("averagePromptsPerDay") private var prompts = 3.0
+    @AppStorage("weekendQuietMode") private var weekendQuietMode = true
     @AppStorage("pomodoroWorkDuration") private var workDuration = 25
     @AppStorage("pomodoroShortBreak") private var shortBreak = 5
     @AppStorage("pomodoroLongBreak") private var longBreak = 15
@@ -2797,8 +3098,7 @@ struct SettingsView: View {
     @AppStorage("meetingAllowlist") private var meetingAllowlist = MeetingAttentionMonitor.defaultAllowlist
 
     @State private var selectedTab = 0
-    @State private var todoistToken: String = ""
-    @State private var todoistTokenSaved = false
+    @AppStorage("tasksSpreadsheetId") private var tasksSpreadsheetId = ""
     // Result of the last "Check connection" — a real round trip to Middleman, so
     // the user can confirm the coach works without waiting for a focus check.
     @State private var claudeStatus: String = ""
@@ -2815,6 +3115,10 @@ struct SettingsView: View {
                     ForEach(14..<22, id: \.self) { Text("\($0):00").tag($0) }
                 }
                 Stepper("Prompts per day: \(Int(prompts))", value: $prompts, in: 1...10)
+                Toggle("Quiet weekends", isOn: $weekendQuietMode)
+                Text("No start-of-day prompt on Saturday/Sunday, and check-ins only while a pomodoro is running or you're at the Mac.")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .tabItem { Label("Sampling", systemImage: "chart.bar.doc.horizontal") }
             .tag(0)
@@ -2844,13 +3148,10 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundColor(claudeStatus.isEmpty ? .secondary : (claudeStatusOK ? .green : .red))
                     .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    SecureField("Todoist API Token", text: $todoistToken)
-                        .onSubmit { saveTodoistToken() }
-                    Button("Save") { saveTodoistToken() }
-                }
-                Text(todoistTokenSaved ? "Token saved" : (todoistToken.isEmpty ? "No Todoist token set" : "Press Save to apply"))
-                    .font(.caption).foregroundColor(todoistTokenSaved ? .green : .secondary)
+                TextField("Tasks spreadsheet ID", text: $tasksSpreadsheetId)
+                Text(tasksStatus)
+                    .font(.caption).foregroundColor(TasksClient.spreadsheetID == nil ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .tabItem { Label("Focus", systemImage: "eye") }
             .tag(2)
@@ -2860,7 +3161,7 @@ struct SettingsView: View {
                 Stepper("Nudge after \(meetingLingerSeconds)s away", value: $meetingLingerSeconds, in: 10...120, step: 5)
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Meeting-OK apps (comma-separated)").font(.caption).foregroundColor(.secondary)
-                    TextField("Notion,Todoist,…", text: $meetingAllowlist)
+                    TextField("Notion,Slack,…", text: $meetingAllowlist)
                 }
                 Text("""
                 In a meeting (mic/camera on), lingering on anything else past the threshold \
@@ -2874,7 +3175,7 @@ struct SettingsView: View {
         }
         .padding()
         .frame(width: 340, height: 320)
-        .onAppear { loadTodoistToken() }
+        .onAppear { }
     }
 
     // A real (tiny) Middleman call with the configured model, so this proves the
@@ -2886,7 +3187,7 @@ struct SettingsView: View {
         MiddlemanClient.sendMessages(model: model.isEmpty ? FocusMonitor.defaultModel : model,
                                      systemPrompt: "Reply with the single word OK.",
                                      messages: [["role": "user", "content": "ping"]],
-                                     maxTokens: 64) { result in
+                                     maxTokens: 512) { result in
             DispatchQueue.main.async {
                 isCheckingClaude = false
                 switch result {
@@ -2902,15 +3203,16 @@ struct SettingsView: View {
         }
     }
 
-    private func loadTodoistToken() {
-        todoistToken = (try? String(contentsOf: TodoistClient.tokenFileURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)) ?? ""
-        todoistTokenSaved = !todoistToken.isEmpty
+    // Empty means "inherit status-dashboard's sheet", which is the normal case —
+    // the two apps deliberately share one list.
+    private var tasksStatus: String {
+        if !tasksSpreadsheetId.isEmpty { return "Reading tasks from this sheet." }
+        if let inherited = TasksClient.dashboardEnvSpreadsheetID() {
+            return "Using status-dashboard's sheet (…\(inherited.suffix(6)) from ~/.config/status-dashboard/.env)."
+        }
+        return "No tasks spreadsheet found — the focus coach can't run without one."
     }
 
-    private func saveTodoistToken() {
-        try? todoistToken.trimmingCharacters(in: .whitespacesAndNewlines).write(to: TodoistClient.tokenFileURL, atomically: true, encoding: .utf8)
-        todoistTokenSaved = true
-    }
 }
 
 // MARK: - Pomodoro Views
@@ -3090,6 +3392,7 @@ struct CoachOKView: View {
 struct CoachErrorView: View {
     let error: CoachError
     var onSignIn: () -> Void
+    var onOpenSettings: () -> Void
     var onDismiss: () -> Void
 
     var body: some View {
@@ -3113,10 +3416,17 @@ struct CoachErrorView: View {
                 Spacer()
                 Button("Dismiss") { onDismiss() }
                     .keyboardShortcut(.escape, modifiers: [])
-                if error.isAuthProblem {
+                switch error.fixAction {
+                case .hawkSignIn:
                     Button("Sign in to Hawk") { onSignIn() }
                         .keyboardShortcut(.return, modifiers: [])
                         .buttonStyle(.borderedProminent)
+                case .tasksSettings:
+                    Button("Open Settings") { onOpenSettings() }
+                        .keyboardShortcut(.return, modifiers: [])
+                        .buttonStyle(.borderedProminent)
+                case .none:
+                    EmptyView()
                 }
             }
         }
@@ -3327,7 +3637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // re-opens the full explanation.
     private var coachStatusMenuItem: NSMenuItem?
     private var lastCoachError: CoachError?
-    // The live top Todoist to-do the focus coach is tracking, shown in the menu.
+    // The live top to-do the focus coach is tracking, shown in the menu.
     private var topTodo: String = ""
     private var intradaySnoozeTimer: Timer?
     // Fires the "start next pomodoro" prompt when a meeting/lunch that ended a
@@ -3451,13 +3761,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOr(FocusMonitor.defaultModel)
             ?? FocusMonitor.defaultModel
         CoachLog.record("connection check starting (model \(model), \(MiddlemanClient.messagesURL?.absoluteString ?? "<no proxy configured>"))")
-        // 64 rather than a handful: Sonnet 5 emits a (usually empty) thinking
-        // block first, and too small a budget gets spent entirely on it, so the
-        // probe comes back with no text and looks like a failure when it isn't.
+        // 512 rather than a handful: Sonnet 5 emits a thinking block first, and it
+        // routinely runs to a couple hundred tokens even for "ping". Too small a
+        // budget gets spent entirely on it, so the probe comes back with no text
+        // and looks like a failure when it isn't.
         MiddlemanClient.sendMessages(model: model,
                                      systemPrompt: "Reply with the single word OK.",
                                      messages: [["role": "user", "content": "ping"]],
-                                     maxTokens: 64) { [weak self] result in
+                                     maxTokens: 512) { [weak self] result in
             DispatchQueue.main.async {
                 switch result {
                 case .success(let json):
@@ -3853,6 +4164,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 HawkAuth.launchInteractiveLogin()
                 self?.closeTopModal()
             },
+            onOpenSettings: { [weak self] in
+                self?.closeTopModal()
+                self?.showSettings()
+            },
             onDismiss: { [weak self] in self?.closeTopModal() }
         )
         showWindow(view)
@@ -3934,6 +4249,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showIntradayPrompt() {
         let hour = Calendar.current.component(.hour, from: Date())
         guard hour >= scheduler.workingHoursStart && hour < scheduler.workingHoursEnd else { return }
+
+        // On weekends only ask when something says the user is working. Returning
+        // here (rather than snoozing) drops the prompt entirely, so a quiet
+        // Saturday doesn't accumulate a stack of modals to answer on Monday.
+        guard PromptPolicy.allowIntradayPrompt(
+            now: Date(),
+            inPomodoro: pomodoroScheduler.phase != .idle,
+            userPresent: PromptPolicy.userIsPresent(),
+            quietWeekends: PromptPolicy.weekendQuietMode
+        ) else { return }
 
         intradaySnoozeTimer?.invalidate()
         var presented = true
