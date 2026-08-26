@@ -138,6 +138,11 @@ Reorder in the dashboard and the coach follows.
 - `gws` is found by absolute path (a GUI app has a bare `PATH`), including a scan
   of `~/.nvm/versions/node/*/bin` since nvm moves it on every Node upgrade;
   override with `defaults write org.metr.ExperienceSampling gwsPath`.
+  Finding `gws` is only half of it: it's a Node script with a
+  `#!/usr/bin/env node` shebang, so `env` has to find `node` too. `runGws`
+  therefore runs it with a `PATH` led by gws's own directory (for an nvm install
+  that's where its matching node lives) — without that the call fails as
+  `gws sheets exited 127: env: node: No such file or directory`.
 - Completing a **recurring** task rolls its due date forward instead of setting
   `done`, so recurring work never shows up in "completed today".
 
