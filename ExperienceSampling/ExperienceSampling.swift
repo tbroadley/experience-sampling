@@ -1169,6 +1169,16 @@ enum TasksClient {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: gws)
         process.arguments = arguments
+        // gws is a Node script with a `#!/usr/bin/env node` shebang, so finding
+        // gws itself isn't enough: `env` has to find `node` too, and a GUI app's
+        // PATH doesn't include nvm's bin dir. Put gws's own directory first —
+        // for an nvm install that's exactly where its matching node lives — so
+        // the interpreter can't come back as `exited 127: env: node: not found`.
+        var env = ProcessInfo.processInfo.environment
+        env["HOME"] = NSHomeDirectory()
+        let gwsDir = (gws as NSString).deletingLastPathComponent
+        env["PATH"] = "\(gwsDir):\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        process.environment = env
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
         process.standardError = err
