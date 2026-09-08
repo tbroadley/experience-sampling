@@ -3646,6 +3646,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // throttled, but this menu row stays until a call succeeds. Clicking it
     // re-opens the full explanation.
     private var coachStatusMenuItem: NSMenuItem?
+    private var completedTodayMenuItem: NSMenuItem?
     private var lastCoachError: CoachError?
     // The live top to-do the focus coach is tracking, shown in the menu.
     private var topTodo: String = ""
@@ -3813,6 +3814,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         takeBreakNow.isHidden = true
         takeBreakNowMenuItem = takeBreakNow
         menu.addItem(takeBreakNow)
+        let completedToday = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        completedToday.isEnabled = false
+        completedTodayMenuItem = completedToday
+        menu.addItem(completedToday)
         let abandon = NSMenuItem(title: "Abandon Pomodoro", action: #selector(abandonPomodoro), keyEquivalent: "")
         abandon.isEnabled = false
         abandonMenuItem = abandon
@@ -4193,6 +4198,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         takeBreakNowMenuItem?.isHidden = !pomodoroScheduler.isBreakSnoozePending
+        let count = PomodoroDataStore.shared.completedTodayCount()
+        completedTodayMenuItem?.title = count == 1
+            ? "1 pomodoro completed today"
+            : "\(count) pomodoros completed today"
     }
 
     @objc private func abandonPomodoro() {
