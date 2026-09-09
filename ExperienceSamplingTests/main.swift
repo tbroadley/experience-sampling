@@ -816,6 +816,42 @@ do {
     checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "a pomodoro from two days ago does not")
 }
 
+section("A pomodoro started before plannedMinutes existed is backfilled on restore")
+do {
+    clearSaved()
+    let store = PomodoroDataStore.shared
+    UserDefaults.standard.set(50, forKey: "pomodoroWorkDuration")
+    let before = store.completedTodayCount(workDuration: 50)
+
+    // A short session as an older build would have written it: no plannedMinutes.
+    let inFlight = PomodoroSession(startTime: Date().addingTimeInterval(-60), taskDescription: "",
+                                   completed: false, pomodoroNumber: 1, plannedMinutes: nil)
+    store.add(inFlight)
+    setSavedState(phase: "work", startOffset: -60, duration: 11 * 60, task: "")
+
+    let s = PomodoroScheduler()
+    s.restoreState()
+    checkEqual(store.fetchRecent(limit: 500).first { $0.id == inFlight.id }?.plannedMinutes, 11,
+               "restore backfills the saved phase duration")
+
+    store.updateLast(endTime: Date(), completed: true)
+    checkEqual(store.completedTodayCount(workDuration: 50), before,
+               "so the short in-flight pomodoro still doesn't count")
+    clearSaved()
+}
+
+section("Backfill never overwrites a length the session already recorded")
+do {
+    clearSaved()
+    let store = PomodoroDataStore.shared
+    let recorded = PomodoroSession(startTime: Date().addingTimeInterval(-60), taskDescription: "",
+                                   completed: false, pomodoroNumber: 1, plannedMinutes: 50)
+    store.add(recorded)
+    store.backfillLastPlannedMinutes(11)
+    checkEqual(store.fetchRecent(limit: 500).first { $0.id == recorded.id }?.plannedMinutes, 50,
+               "existing plannedMinutes is left alone")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")

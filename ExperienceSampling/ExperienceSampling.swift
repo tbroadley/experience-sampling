@@ -151,6 +151,17 @@ final class PomodoroDataStore {
         save()
     }
 
+    /// Fill in `plannedMinutes` on the in-flight session when it's missing —
+    /// it was started by a build from before the field existed. Without this, a
+    /// pomodoro that was capped short and then survived an app upgrade decodes
+    /// as `nil` and counts as full length. Only ever fills a gap; a session that
+    /// already recorded its length is left alone.
+    func backfillLastPlannedMinutes(_ minutes: Int) {
+        guard let last = sessions.last, last.plannedMinutes == nil else { return }
+        sessions[sessions.count - 1].plannedMinutes = minutes
+        save()
+    }
+
     func updateLast(endTime: Date, completed: Bool) {
         guard !sessions.isEmpty else { return }
         sessions[sessions.count - 1].endTime = endTime
@@ -391,6 +402,11 @@ final class PomodoroScheduler: ObservableObject {
         let duration = UserDefaults.standard.integer(forKey: phaseDurationKey)
         let elapsed = Int(Date().timeIntervalSince(phaseStart))
         let remaining = duration - elapsed
+
+        // The saved phase duration is the authority on how long this session was
+        // meant to run, so use it to backfill a session started before
+        // `plannedMinutes` was recorded — before deciding whether it completed.
+        if savedPhase == .work { PomodoroDataStore.shared.backfillLastPlannedMinutes(duration / 60) }
 
         if remaining > 0 {
             phase = savedPhase
