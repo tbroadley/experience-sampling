@@ -3814,6 +3814,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // pomodoro is itself over, so the pomodoro flow resumes after the break.
     private var resumeTimer: Timer?
     private let snoozeDuration: TimeInterval = 5 * 60
+    // Held for the lifetime of the playback: NSSound stops if it's deallocated.
+    private var milestoneSound: NSSound?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -3842,6 +3844,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             self.focusMonitor.stop()
             self.topTodo = ""
+            self.playMilestoneSoundIfDue()
             // If a calendar block is starting now, don't offer a break: a video
             // meeting passes silently; a non-video block (e.g. "Lunch") shows a
             // notice. Otherwise fall through to the normal break prompt.
@@ -4375,6 +4378,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func takeBreakNow() {
         pomodoroScheduler.cancelBreakSnooze()
         pomodoroScheduler.startBreak(isLong: pomodoroScheduler.isLongBreakDue())
+    }
+
+    // Number of completed pomodoros in a day that earns the celebration sound.
+    private static let milestonePomodoroCount = 5
+
+    /// Where the celebration sound lives. Deliberately *not* bundled: this repo is
+    /// public and the recording is personal. Default is
+    /// `~/Library/Application Support/ExperienceSampling/fifth-pomodoro.mp3`;
+    /// override with
+    /// `defaults write org.metr.ExperienceSampling milestoneSoundPath /path/to.mp3`.
+    private var milestoneSoundURL: URL {
+        if let override = UserDefaults.standard.string(forKey: "milestoneSoundPath"), !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+        }
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport
+            .appendingPathComponent("ExperienceSampling", isDirectory: true)
+            .appendingPathComponent("fifth-pomodoro.mp3")
+    }
+
+    /// Play the celebration sound when the day's pomodoro count reaches the
+    /// milestone. Called from `onWorkSessionEnd`, which runs *after* the session
+    /// has been marked completed, so the finished pomodoro is already counted.
+    /// The `==` (not `>=`) means it fires once a day, on the fifth one only.
+    private func playMilestoneSoundIfDue() {
+        // Same count the menu shows — full-length pomodoros only, so a session
+        // cut short by a meeting doesn't quietly earn the sound.
+        let completedToday = PomodoroDataStore.shared.completedTodayCount(workDuration: pomodoroScheduler.workDuration)
+        guard completedToday == Self.milestonePomodoroCount else { return }
+        let url = milestoneSoundURL
+        guard let sound = NSSound(contentsOf: url, byReference: true) else {
+            // No sound file installed is a fine, silent-by-choice state, but it
+            // shouldn't be invisible: log it rather than wondering why the
+            // fifth pomodoro passed quietly.
+            CoachLog.record("milestone sound not playable at \(url.path)")
+            return
+        }
+        milestoneSound = sound
+        sound.play()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
