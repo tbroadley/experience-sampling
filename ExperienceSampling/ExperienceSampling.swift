@@ -34,6 +34,18 @@ struct PomodoroSession: Codable, Identifiable {
     var taskDescription: String
     var completed: Bool
     var pomodoroNumber: Int  // 1-4, for tracking long break cycle
+    /// Length the session was started with, in minutes. Meeting- and
+    /// workday-aware capping can start a pomodoro shorter than the configured
+    /// work duration; those short ones don't count towards the daily total.
+    /// `nil` on sessions written before this was recorded — treated as full.
+    var plannedMinutes: Int?
+
+    /// A session counts towards the daily total only if it ran the full
+    /// configured work duration.
+    func isFullLength(workDuration: Int) -> Bool {
+        guard let plannedMinutes else { return true }
+        return plannedMinutes >= workDuration
+    }
 }
 
 // MARK: - Simple JSON Storage
@@ -150,19 +162,26 @@ final class PomodoroDataStore {
         Array(sessions.sorted { $0.startTime > $1.startTime }.prefix(limit))
     }
 
-    func completedTodayCount() -> Int {
+    /// Completed *full-length* pomodoros started today. Short ones (capped by a
+    /// meeting or the end of the workday) are deliberately excluded.
+    func completedTodayCount(workDuration: Int) -> Int {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
-        return sessions.filter { $0.completed && calendar.startOfDay(for: $0.startTime) == today }.count
+        return sessions.filter {
+            $0.completed
+                && calendar.startOfDay(for: $0.startTime) == today
+                && $0.isFullLength(workDuration: workDuration)
+        }.count
     }
 
     func exportCSV() -> URL {
         let formatter = ISO8601DateFormatter()
-        var csv = "id,start_time,end_time,task,completed,pomodoro_number\n"
+        var csv = "id,start_time,end_time,task,completed,pomodoro_number,planned_minutes\n"
         for s in sessions.sorted(by: { $0.startTime < $1.startTime }) {
             let task = s.taskDescription.replacingOccurrences(of: "\"", with: "\"\"")
             let endTime = s.endTime.map { formatter.string(from: $0) } ?? ""
-            csv += "\(s.id),\(formatter.string(from: s.startTime)),\(endTime),\"\(task)\",\(s.completed),\(s.pomodoroNumber)\n"
+            let planned = s.plannedMinutes.map(String.init) ?? ""
+            csv += "\(s.id),\(formatter.string(from: s.startTime)),\(endTime),\"\(task)\",\(s.completed),\(s.pomodoroNumber),\(planned)\n"
         }
         let exportURL = FileManager.default.temporaryDirectory.appendingPathComponent("pomodoro-export.csv")
         try? csv.write(to: exportURL, atomically: true, encoding: .utf8)
@@ -424,7 +443,8 @@ final class PomodoroScheduler: ObservableObject {
             startTime: Date(),
             taskDescription: "",
             completed: false,
-            pomodoroNumber: pomodoroCount
+            pomodoroNumber: pomodoroCount,
+            plannedMinutes: effectiveDuration
         ))
 
         saveState()
@@ -4343,7 +4363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         takeBreakNowMenuItem?.isHidden = !pomodoroScheduler.isBreakSnoozePending
-        let count = PomodoroDataStore.shared.completedTodayCount()
+        let count = PomodoroDataStore.shared.completedTodayCount(workDuration: pomodoroScheduler.workDuration)
         completedTodayMenuItem?.title = count == 1
             ? "1 pomodoro completed today"
             : "\(count) pomodoros completed today"

@@ -773,6 +773,49 @@ do {
     check(PromptPolicy.userIsPresent(idleSeconds: 5, screenLocked: false), "recent input means present")
 }
 
+// MARK: - Daily pomodoro count
+
+section("PomodoroSession.isFullLength: short pomodoros don't count")
+do {
+    func session(plannedMinutes: Int?) -> PomodoroSession {
+        PomodoroSession(startTime: Date(), taskDescription: "", completed: true,
+                        pomodoroNumber: 1, plannedMinutes: plannedMinutes)
+    }
+    check(session(plannedMinutes: 25).isFullLength(workDuration: 25), "a full-length pomodoro counts")
+    check(!session(plannedMinutes: 12).isFullLength(workDuration: 25),
+          "one capped short by a meeting doesn't count")
+    check(session(plannedMinutes: nil).isFullLength(workDuration: 25),
+          "a session recorded before plannedMinutes existed still counts")
+    check(session(plannedMinutes: 30).isFullLength(workDuration: 25),
+          "a longer-than-configured session counts")
+}
+
+section("PomodoroDataStore.completedTodayCount")
+do {
+    let store = PomodoroDataStore.shared
+    let before = store.completedTodayCount(workDuration: 25)
+
+    store.add(PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                              pomodoroNumber: 1, plannedMinutes: 25))
+    store.updateLast(endTime: Date(), completed: true)
+    checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "a full pomodoro adds to today")
+
+    store.add(PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                              pomodoroNumber: 2, plannedMinutes: 10))
+    store.updateLast(endTime: Date(), completed: true)
+    checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "a short pomodoro does not")
+
+    store.add(PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                              pomodoroNumber: 3, plannedMinutes: 25))
+    store.updateLast(endTime: Date(), completed: false)
+    checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "an abandoned pomodoro does not")
+
+    store.add(PomodoroSession(startTime: Date().addingTimeInterval(-48 * 3600), taskDescription: "",
+                              completed: false, pomodoroNumber: 4, plannedMinutes: 25))
+    store.updateLast(endTime: Date().addingTimeInterval(-48 * 3600), completed: true)
+    checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "a pomodoro from two days ago does not")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")
