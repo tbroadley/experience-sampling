@@ -87,7 +87,27 @@ the exit status. Two traps:
   calendar is indistinguishable from a broken one: no nudges, no capping, no
   Meet links, no trace. Failures now go to `coach-errors.log` via
   `CoachLog.record(_:context:)`, logged once per error kind with a matching
-  "calendar recovered" line.
+  "calendar recovered" line — **and** onto the same modal + pinned menu-bar row
+  as the coach errors (`CalendarMonitor.onError` → `showCoachError`), throttled
+  per kind by `CoachErrorThrottle`. Logging alone wasn't enough: a missing
+  `calendar` scope once sat in the log for twelve days because nothing the user
+  could see changed.
+- `CalendarMonitor.calendarError(from:)` re-labels the generic `TasksClient`
+  failure as `calendarAuthRequired` / `calendarScopeMissing` /
+  `calendarUnavailable`. Two reasons it can't just pass the tasks error through:
+  the modal would say "can't read the task sheet" for an OAuth problem, and
+  `runGws` classifies a 403 as `tasksAuthRequired` (`looksLikeAuthFailure`
+  matches `"403"`), so the scope case has to be recognised from the *detail
+  text* — `looksLikeMissingScope` — not the error case.
+- The `.gwsSignIn` fix action runs
+  `gws auth login --services drive,gmail,sheets,docs,calendar` in Terminal via a
+  `.command` file (no Automation permission) **and deletes `token_cache.json`**.
+  Don't drop either half: a bare `gws auth login` re-grants without calendar, and
+  the cache outlives the re-login, so skipping the delete makes a correct
+  re-grant still 403.
+- The pinned menu-bar row is shared, so both recovery handlers check the
+  `calendar-` kind prefix before clearing it. Without that, a coach recovery
+  wipes a still-valid calendar warning and vice versa.
 
 ## Meeting Attention
 
