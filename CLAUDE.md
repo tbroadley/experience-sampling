@@ -37,7 +37,12 @@ stores never touch real data. Exit code is non-zero on any failure.
 Data is stored in `~/Library/Application Support/ExperienceSampling/`:
 - `responses.json` - Experience sampling responses
 - `pomodoro-sessions.json` - Pomodoro session history (`taskDescription` is now
-  always empty — the per-pomodoro goal feature was removed)
+  always empty — the per-pomodoro goal feature was removed). `plannedMinutes`
+  records the length the session was *started* with; meeting- and
+  workday-aware capping can start one shorter than `pomodoroWorkDuration`, and
+  those short ones are excluded from the "completed today" menu count
+  (`completedTodayCount(workDuration:)`). It's optional: sessions written before
+  the field existed decode as `nil` and count as full length.
 - (no task credentials: the Google Sheet task list is reached via the `gws` CLI,
   which owns its own auth. A leftover `todoist-api-token.txt` is dead.)
 - `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
