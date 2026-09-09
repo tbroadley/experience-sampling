@@ -673,6 +673,65 @@ do {
                "Hawk errors still offer a Hawk sign-in")
 }
 
+section("CalendarMonitor: read failures are surfaced, not just logged")
+do {
+    // The exact string that took meeting support out for twelve days, as gws
+    // actually emits it (403 in the body, zero exit code).
+    let scopeDetail = "gws API error: {code: 403, message: Request had insufficient authentication scopes., reason: insufficientPermissions}"
+    check(CalendarMonitor.looksLikeMissingScope(scopeDetail), "the real-world scope failure is recognised")
+    check(CalendarMonitor.looksLikeMissingScope("error[api]: Request had insufficient authentication scopes."),
+          "gws's own wording is recognised too")
+    check(!CalendarMonitor.looksLikeMissingScope("gws calendar exited 5: HTTP request failed"),
+          "an ordinary failure is not mistaken for a scope problem")
+
+    // runGws classifies a 403 as tasksAuthRequired (looksLikeAuthFailure matches
+    // "403"), so the scope case has to be picked out of the detail, not the case.
+    checkEqual(CalendarMonitor.calendarError(from: .tasksAuthRequired(scopeDetail)).kind,
+               "calendar-scope-missing",
+               "a scope failure is re-labelled even though runGws called it an auth failure")
+    checkEqual(CalendarMonitor.calendarError(from: .tasksAuthRequired("invalid_grant")).kind,
+               "calendar-auth-required",
+               "a genuine sign-in failure stays an auth failure")
+    checkEqual(CalendarMonitor.calendarError(from: .tasksUnavailable("gws not found")).kind,
+               "calendar-unavailable",
+               "everything else is a plain calendar outage")
+
+    // The whole point of the change: these reach the user, and point at the
+    // re-grant rather than the spreadsheet settings.
+    checkEqual(CoachError.calendarScopeMissing("x").fixAction, CoachError.FixAction.gwsSignIn,
+               "a missing scope offers the Google re-authorise button")
+    checkEqual(CoachError.calendarAuthRequired("x").fixAction, CoachError.FixAction.gwsSignIn,
+               "so does a missing Google sign-in")
+    check(CoachError.calendarScopeMissing("x").isAuthProblem, "a missing scope is not retried in a loop")
+    check(CoachError.calendarUnavailable("x").isTransient, "a transient calendar outage is retried")
+    check(!CoachError.calendarScopeMissing("x").isTransient,
+          "a missing scope is never retried — only a re-grant fixes it")
+
+    check(CoachError.calendarScopeMissing("x").title.hasPrefix("Calendar:"),
+          "the modal says Calendar, not Focus coach — the coach itself is fine")
+    check(CoachError.calendarScopeMissing("x").advice.contains("calendar"),
+          "the advice names the scope that has to be granted")
+
+    // The pinned menu-bar row is keyed off this prefix, so both recovery
+    // handlers can tell whose error is showing.
+    check(CoachError.calendarUnavailable("x").kind.hasPrefix("calendar-"),
+          "calendar kinds share the prefix the menu-bar row keys off")
+    check(!CoachError.tasksUnavailable("x").kind.hasPrefix("calendar-"),
+          "a tasks error is not mistaken for a calendar one")
+
+    // Throttling: one modal per kind per window, not one every 5-minute refresh.
+    var throttle = CoachErrorThrottle()
+    let start = Date()
+    check(throttle.shouldSurface(.calendarScopeMissing("x"), now: start), "the first failure surfaces")
+    check(!throttle.shouldSurface(.calendarScopeMissing("x"), now: start.addingTimeInterval(60)),
+          "the same failure a minute later is swallowed")
+    check(throttle.shouldSurface(.calendarScopeMissing("x"), now: start.addingTimeInterval(11 * 60)),
+          "it surfaces again once the window has passed")
+    throttle.reset()
+    check(throttle.shouldSurface(.calendarScopeMissing("x"), now: start.addingTimeInterval(11 * 60)),
+          "a recovery re-arms the throttle, so the next break is loud again")
+}
+
 section("PromptPolicy: weekends are quiet unless there's work happening")
 do {
     var cal = Calendar(identifier: .gregorian)

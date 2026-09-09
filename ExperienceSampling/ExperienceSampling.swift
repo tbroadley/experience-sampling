@@ -744,6 +744,13 @@ final class CalendarMonitor {
     private var earlyExitMeetings: Set<String> = []
     private var avCheckTimer: Timer?
     private var lastCalendarErrorKind: String?
+    private var errorThrottle = CoachErrorThrottle()
+    /// Fired (on the main queue) when a calendar read fails in a way the user
+    /// needs to know about — throttled per kind, like the coach's own errors.
+    var onError: ((CoachError) -> Void)?
+    /// Fired (on the main queue) the first time a refresh succeeds after
+    /// failures, so the UI can clear its "calendar is broken" indicator.
+    var onRecovered: (() -> Void)?
     private let refreshInterval: TimeInterval = 5 * 60
     private let meetOpenBuffer: TimeInterval = 60
     private let avChecksBeforeEarlyExit = 2
@@ -1001,23 +1008,58 @@ final class CalendarMonitor {
         }
     }
 
+    /// Re-labels a generic `TasksClient.runGws` failure as its calendar
+    /// equivalent. Worth doing rather than passing the tasks error straight
+    /// through: a calendar outage surfaced as "can't read the task sheet" sends
+    /// the user to the spreadsheet settings for a problem that lives in the
+    /// OAuth grant.
+    ///
+    /// Pure and static so the mapping is unit-tested without a Google round trip.
+    static func calendarError(from error: CoachError) -> CoachError {
+        let detail = error.detail
+        if looksLikeMissingScope(detail) { return .calendarScopeMissing(detail) }
+        switch error {
+        case .tasksAuthRequired: return .calendarAuthRequired(detail)
+        default: return .calendarUnavailable(detail)
+        }
+    }
+
+    /// A missing `calendar` scope comes back as 403 `insufficientPermissions`,
+    /// worded a couple of different ways depending on whether gws or the API
+    /// surfaced it.
+    static func looksLikeMissingScope(_ detail: String) -> Bool {
+        let lowered = detail.lowercased()
+        return lowered.contains("insufficient authentication scopes")
+            || lowered.contains("insufficientpermissions")
+            || lowered.contains("insufficient permission")
+    }
+
     /// Logs a calendar read failure once per kind — the refresh timer fires every
-    /// 5 minutes, and a sustained outage shouldn't bury the log.
+    /// 5 minutes, and a sustained outage shouldn't bury the log — and surfaces it
+    /// to the UI on the same throttle the coach errors use. Logging alone was the
+    /// old behaviour, and it meant a dead calendar scope sat unnoticed in
+    /// coach-errors.log for twelve days.
     private func reportCalendarFailure(_ error: CoachError) {
+        let mapped = Self.calendarError(from: error)
         // Hops to main because `refresh` runs on a concurrent queue and this
         // state, like `events`, is only ever touched there.
         DispatchQueue.main.async {
-            guard self.lastCalendarErrorKind != error.kind else { return }
-            self.lastCalendarErrorKind = error.kind
-            CoachLog.record(error, context: "calendar refresh")
+            if self.lastCalendarErrorKind != mapped.kind {
+                self.lastCalendarErrorKind = mapped.kind
+                CoachLog.record(mapped, context: "calendar refresh")
+            }
+            guard self.errorThrottle.shouldSurface(mapped) else { return }
+            self.onError?(mapped)
         }
     }
 
     private func reportCalendarSuccess() {
         DispatchQueue.main.async {
-            guard self.lastCalendarErrorKind != nil else { return }
+            guard self.lastCalendarErrorKind != nil || self.errorThrottle.hasRecordedFailures else { return }
             CoachLog.record("calendar recovered — a refresh succeeded after earlier failures")
             self.lastCalendarErrorKind = nil
+            self.errorThrottle.reset()
+            self.onRecovered?()
         }
     }
 }
@@ -1211,6 +1253,37 @@ enum TasksClient {
         return .success(json)
     }
 
+    /// Every service this app reads through gws. `gws auth login` with no
+    /// `--services` re-grants a *default* set that omits calendar, so a bare
+    /// re-login silently drops meeting support — always pass the full list.
+    static let requiredServices = "drive,gmail,sheets,docs,calendar"
+
+    /// Opens Terminal on the gws re-grant, the same `.command` trick
+    /// `HawkAuth.launchInteractiveLogin` uses so no Automation permission is
+    /// needed. Deletes the token cache afterwards: it outlives a re-login, so
+    /// without this the very next call still 403s with the pre-grant token and
+    /// the user reasonably concludes the fix didn't work.
+    @discardableResult
+    static func launchInteractiveLogin() -> Bool {
+        guard let path = findGws() else { return false }
+        let cache = "\(NSHomeDirectory())/.config/gws/token_cache.json"
+        let script = """
+        #!/bin/bash
+        echo "Re-authorising Google for Experience Sampling (including calendar)…"
+        PATH="\((path as NSString).deletingLastPathComponent):$PATH" \
+        "\(path)" auth login --services \(requiredServices)
+        rm -f "\(cache)"
+        echo
+        echo "Done — you can close this window. The calendar refreshes within 5 minutes."
+        """
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("gws-auth-login.command")
+        guard (try? script.write(to: url, atomically: true, encoding: .utf8)) != nil,
+              (try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)) != nil else {
+            return false
+        }
+        return NSWorkspace.shared.open(url)
+    }
+
     static func looksLikeAuthFailure(_ stderr: String) -> Bool {
         let lowered = stderr.lowercased()
         return ["unauthorized", "invalid_grant", "credential", "not authenticated",
@@ -1394,6 +1467,17 @@ enum CoachError: Error, Equatable {
     case tasksAuthRequired(String)
     /// gws missing, the Sheets call failed, or the reply didn't parse.
     case tasksUnavailable(String)
+    /// The `gws` CLI has no usable Google credentials, so the calendar can't be
+    /// read. Distinct from the tasks cases because it takes out a different set
+    /// of features and the advice differs.
+    case calendarAuthRequired(String)
+    /// gws is authenticated but the grant is missing the `calendar` scope. Its
+    /// own case because it is both the most likely calendar failure and the one
+    /// with the least guessable fix — `gws auth login` alone re-grants without
+    /// calendar, and the token cache survives the re-login.
+    case calendarScopeMissing(String)
+    /// gws missing, the Calendar call failed, or the reply didn't parse.
+    case calendarUnavailable(String)
 
     /// Stable short name, used as the throttle key and in log lines.
     var kind: String {
@@ -1409,17 +1493,22 @@ enum CoachError: Error, Equatable {
         case .tasksNotConfigured: return "tasks-not-configured"
         case .tasksAuthRequired: return "tasks-auth-required"
         case .tasksUnavailable: return "tasks-unavailable"
+        case .calendarAuthRequired: return "calendar-auth-required"
+        case .calendarScopeMissing: return "calendar-scope-missing"
+        case .calendarUnavailable: return "calendar-unavailable"
         }
     }
 
     /// Which button the error modal should offer, if any.
-    enum FixAction { case none, hawkSignIn, tasksSettings }
+    enum FixAction { case none, hawkSignIn, tasksSettings, gwsSignIn }
 
     var fixAction: FixAction {
         switch self {
         case .hawkMissing, .notAuthenticated, .tokenRejected: return .hawkSignIn
         case .tasksNotConfigured: return .tasksSettings
-        case .tasksAuthRequired: return .none
+        // All three are fixed by the same re-grant, so they get the same button
+        // rather than asking the user to retype a long `--services` list.
+        case .tasksAuthRequired, .calendarAuthRequired, .calendarScopeMissing: return .gwsSignIn
         default: return .none
         }
     }
@@ -1431,6 +1520,7 @@ enum CoachError: Error, Equatable {
         switch self {
         case .hawkMissing, .notAuthenticated, .tokenRejected: return true
         case .tasksNotConfigured, .tasksAuthRequired: return true
+        case .calendarAuthRequired, .calendarScopeMissing: return true
         default: return false
         }
     }
@@ -1438,7 +1528,7 @@ enum CoachError: Error, Equatable {
     /// True when trying again shortly might just work.
     var isTransient: Bool {
         switch self {
-        case .networkUnavailable, .tasksUnavailable: return true
+        case .networkUnavailable, .tasksUnavailable, .calendarUnavailable: return true
         case .httpError(let status, _): return status == 408 || status == 429 || status >= 500
         default: return false
         }
@@ -1458,6 +1548,9 @@ enum CoachError: Error, Equatable {
         case .tasksNotConfigured: return "Focus coach: no task list configured"
         case .tasksAuthRequired: return "Focus coach: Google sign-in needed"
         case .tasksUnavailable: return "Focus coach: can't read the task sheet"
+        case .calendarAuthRequired: return "Calendar: Google sign-in needed"
+        case .calendarScopeMissing: return "Calendar: permission missing"
+        case .calendarUnavailable: return "Calendar: can't read your calendar"
         }
     }
 
@@ -1497,6 +1590,29 @@ enum CoachError: Error, Equatable {
             return "The gws CLI can't reach Google. Run `gws auth login` in a terminal; the coach picks it up on the next check."
         case .tasksUnavailable:
             return "Reading the tasks spreadsheet failed. The coach retries on the next check; see coach-errors.log for the detail."
+        // The calendar advice all names the three features that are down, because
+        // their absence is silent: nothing happening is exactly what a quiet
+        // calendar looks like, which is how this went unnoticed for days.
+        case .calendarAuthRequired:
+            return """
+            The gws CLI can't reach Google, so meeting nudges, meeting-aware \
+            pomodoro capping and Meet-link auto-open are all off. Re-authorise \
+            below, or run `gws auth login --services drive,gmail,sheets,docs,calendar`.
+            """
+        case .calendarScopeMissing:
+            return """
+            Google is signed in but the grant is missing the `calendar` scope, so \
+            meeting nudges, meeting-aware pomodoro capping and Meet-link \
+            auto-open are all off. Plain `gws auth login` does not grant it — \
+            re-authorise below, which asks for calendar too and clears gws's \
+            token cache (it outlives a re-login and would keep failing otherwise).
+            """
+        case .calendarUnavailable:
+            return """
+            Reading your calendar failed, so meeting nudges, meeting-aware \
+            pomodoro capping and Meet-link auto-open are off. The app retries \
+            every 5 minutes; see coach-errors.log for the detail.
+            """
         }
     }
 
@@ -1507,7 +1623,9 @@ enum CoachError: Error, Equatable {
         case .hawkMissing(let d), .notAuthenticated(let d), .tokenRejected(let d),
              .networkUnavailable(let d), .modelNotEntitled(let d), .badResponse(let d),
              .proxyNotConfigured(let d), .tasksNotConfigured(let d),
-             .tasksAuthRequired(let d), .tasksUnavailable(let d):
+             .tasksAuthRequired(let d), .tasksUnavailable(let d),
+             .calendarAuthRequired(let d), .calendarScopeMissing(let d),
+             .calendarUnavailable(let d):
             return d
         case .httpError(_, let d):
             return d
@@ -3403,6 +3521,7 @@ struct CoachErrorView: View {
     let error: CoachError
     var onSignIn: () -> Void
     var onOpenSettings: () -> Void
+    var onGwsSignIn: () -> Void
     var onDismiss: () -> Void
 
     var body: some View {
@@ -3433,6 +3552,10 @@ struct CoachErrorView: View {
                         .buttonStyle(.borderedProminent)
                 case .tasksSettings:
                     Button("Open Settings") { onOpenSettings() }
+                        .keyboardShortcut(.return, modifiers: [])
+                        .buttonStyle(.borderedProminent)
+                case .gwsSignIn:
+                    Button("Re-authorise Google") { onGwsSignIn() }
                         .keyboardShortcut(.return, modifiers: [])
                         .buttonStyle(.borderedProminent)
                 case .none:
@@ -3723,14 +3846,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.showCoachError(error)
         }
         focusMonitor.onCoachRecovered = { [weak self] in
-            self?.lastCoachError = nil
-            self?.coachStatusMenuItem?.isHidden = true
+            guard let self, let shown = self.lastCoachError else { return }
+            // Don't clear a pinned calendar error: the coach recovering says
+            // nothing about whether the calendar is still broken.
+            guard !shown.kind.hasPrefix("calendar-") else { return }
+            self.lastCoachError = nil
+            self.coachStatusMenuItem?.isHidden = true
         }
 
         meetingMonitor.onNudge = { [weak self] in self?.showMeetingNudge() }
         meetingMonitor.isInScheduledMeeting = { [weak self] in self?.calendarMonitor.isInVideoMeeting() ?? false }
         meetingMonitor.start()
 
+        // The calendar shares the coach's error surface — same modal, same
+        // menu-bar row. A dead calendar takes out meeting nudges, pomodoro
+        // capping and Meet-link auto-open, none of which announce their absence.
+        calendarMonitor.onError = { [weak self] error in
+            self?.showCoachError(error)
+        }
+        calendarMonitor.onRecovered = { [weak self] in
+            guard let self, let shown = self.lastCoachError else { return }
+            // Only clear if the pinned row is the calendar's own — a live coach
+            // error must not be wiped by an unrelated calendar recovery.
+            guard shown.kind.hasPrefix("calendar-") else { return }
+            self.lastCoachError = nil
+            self.coachStatusMenuItem?.isHidden = true
+        }
         calendarMonitor.start()
         pomodoroScheduler.restoreState()
         wakeDetector.checkForNewDay()
@@ -4182,6 +4323,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             onOpenSettings: { [weak self] in
                 self?.closeTopModal()
                 self?.showSettings()
+            },
+            onGwsSignIn: { [weak self] in
+                TasksClient.launchInteractiveLogin()
+                self?.closeTopModal()
             },
             onDismiss: { [weak self] in self?.closeTopModal() }
         )
