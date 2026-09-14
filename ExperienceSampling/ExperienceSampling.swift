@@ -27,6 +27,21 @@ enum PomodoroPhase: String, Codable {
     case longBreak
 }
 
+enum PomodoroMenuAction: String {
+    case start = "Start Pomodoro"
+    case abandon = "Abandon Pomodoro"
+    case takeBreak = "Take Break Now"
+    case endBreak = "End Break"
+
+    static func action(phase: PomodoroPhase, secondsRemaining: Int) -> PomodoroMenuAction {
+        switch phase {
+        case .idle: return .start
+        case .work: return secondsRemaining > 0 ? .abandon : .takeBreak
+        case .shortBreak, .longBreak: return .endBreak
+        }
+    }
+}
+
 struct PomodoroSession: Codable, Identifiable {
     var id: UUID = UUID()
     var startTime: Date
@@ -36,15 +51,13 @@ struct PomodoroSession: Codable, Identifiable {
     var pomodoroNumber: Int  // 1-4, for tracking long break cycle
     /// Length the session was started with, in minutes. Meeting- and
     /// workday-aware capping can start a pomodoro shorter than the configured
-    /// work duration; those short ones don't count towards the daily total.
+    /// work duration; sessions below 90% don't count towards the daily total.
     /// `nil` on sessions written before this was recorded — treated as full.
     var plannedMinutes: Int?
 
-    /// A session counts towards the daily total only if it ran the full
-    /// configured work duration.
-    func isFullLength(workDuration: Int) -> Bool {
+    func meetsDailyCountThreshold(workDuration: Int) -> Bool {
         guard let plannedMinutes else { return true }
-        return plannedMinutes >= workDuration
+        return Double(plannedMinutes) >= Double(workDuration) * 0.9
     }
 }
 
@@ -173,15 +186,15 @@ final class PomodoroDataStore {
         Array(sessions.sorted { $0.startTime > $1.startTime }.prefix(limit))
     }
 
-    /// Completed *full-length* pomodoros started today. Short ones (capped by a
-    /// meeting or the end of the workday) are deliberately excluded.
+    /// Completed pomodoros started today with at least 90% of the configured
+    /// work duration, including sessions slightly shortened by calendar caps.
     func completedTodayCount(workDuration: Int) -> Int {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         return sessions.filter {
             $0.completed
                 && calendar.startOfDay(for: $0.startTime) == today
-                && $0.isFullLength(workDuration: workDuration)
+                && $0.meetsDailyCountThreshold(workDuration: workDuration)
         }.count
     }
 
@@ -418,6 +431,9 @@ final class PomodoroScheduler: ObservableObject {
         } else {
             clearSavedState()
             if savedPhase == .work {
+                phase = .work
+                timeRemaining = 0
+                onTimerTick?(0, .work)
                 PomodoroDataStore.shared.updateLast(endTime: phaseStart.addingTimeInterval(Double(duration)), completed: true)
                 onWorkSessionEnd?()
             } else {
@@ -440,11 +456,17 @@ final class PomodoroScheduler: ObservableObject {
         UserDefaults.standard.removeObject(forKey: taskKey)
     }
 
+    var menuAction: PomodoroMenuAction {
+        PomodoroMenuAction.action(phase: phase, secondsRemaining: timeRemaining)
+    }
+
     var workDurationOverride: Int?
 
     func startWork() {
+        guard phase == .idle else { return }
         snoozeTimer?.invalidate()
         snoozeTimer = nil
+        cancelBreakSnooze()
         pomodoroCount = (pomodoroCount % 4) + 1
         phase = .work
         let effectiveDuration = workDurationOverride ?? workDuration
@@ -469,6 +491,9 @@ final class PomodoroScheduler: ObservableObject {
     }
 
     func startBreak(isLong: Bool) {
+        snoozeTimer?.invalidate()
+        snoozeTimer = nil
+        cancelBreakSnooze()
         phase = isLong ? .longBreak : .shortBreak
         phaseDuration = (isLong ? longBreakDuration : shortBreakDuration) * 60
         timeRemaining = phaseDuration
@@ -479,15 +504,16 @@ final class PomodoroScheduler: ObservableObject {
     }
 
     func abandon() {
-        phase = .idle
-        stopDisplayTimer()
-        snoozeTimer?.invalidate()
-        snoozeTimer = nil
-        breakSnoozeTimer?.invalidate()
-        breakSnoozeTimer = nil
-        clearSavedState()
-        PomodoroDataStore.shared.updateLast(endTime: Date(), completed: false)
-        onTimerTick?(0, .idle)
+        if menuAction == .abandon {
+            PomodoroDataStore.shared.updateLast(endTime: Date(), completed: false)
+        }
+        endToIdle()
+    }
+
+    func endBreak() {
+        guard phase == .shortBreak || phase == .longBreak else { return }
+        endToIdle()
+        onBreakEnd?()
     }
 
     /// Finalize a completed work session that won't be followed by a break — e.g.
@@ -498,6 +524,9 @@ final class PomodoroScheduler: ObservableObject {
     /// incomplete — it was already recorded `completed` when the timer expired.
     func endToIdle() {
         phase = .idle
+        timeRemaining = 0
+        phaseStartDate = nil
+        phaseDuration = 0
         stopDisplayTimer()
         snoozeTimer?.invalidate()
         snoozeTimer = nil
@@ -510,6 +539,7 @@ final class PomodoroScheduler: ObservableObject {
     func scheduleSnooze() {
         snoozeTimer?.invalidate()
         snoozeTimer = Timer.scheduledTimer(withTimeInterval: Double(snoozeDuration * 60), repeats: false) { [weak self] _ in
+            self?.snoozeTimer = nil
             self?.onSnoozeEnd?()
         }
     }
@@ -517,6 +547,7 @@ final class PomodoroScheduler: ObservableObject {
     func scheduleBreakSnooze() {
         breakSnoozeTimer?.invalidate()
         breakSnoozeTimer = Timer.scheduledTimer(withTimeInterval: Double(breakSnoozeDuration * 60), repeats: false) { [weak self] _ in
+            self?.breakSnoozeTimer = nil
             self?.onBreakSnoozeEnd?()
         }
     }
@@ -531,7 +562,7 @@ final class PomodoroScheduler: ObservableObject {
     private func startDisplayTimer() {
         stopDisplayTimer()
         onTimerTick?(timeRemaining, phase)
-        displayTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard let self, let start = self.phaseStartDate else { return }
             let elapsed = Int(Date().timeIntervalSince(start))
             self.timeRemaining = max(self.phaseDuration - elapsed, 0)
@@ -544,11 +575,12 @@ final class PomodoroScheduler: ObservableObject {
                     PomodoroDataStore.shared.updateLast(endTime: Date(), completed: true)
                     self.onWorkSessionEnd?()
                 } else {
-                    self.phase = .idle
-                    self.onBreakEnd?()
+                    self.endBreak()
                 }
             }
         }
+        displayTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func stopDisplayTimer() {
@@ -3772,7 +3804,7 @@ private final class PromptWindowCloseDelegate: NSObject, NSWindowDelegate {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private var statusItem: NSStatusItem!
     // Stack of open modal windows. Pushing a new modal leaves the ones beneath
     // alive; closing the top re-surfaces the previous one. Delegates are held in
@@ -3788,6 +3820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // fire twice (didWake + screensDidWake) before the user commits, which would
     // otherwise stack a second prompt on top of the first.
     private var startOfDayPromptOpen = false
+    private weak var pomodoroTransitionWindow: NSWindow?
     // Live model for the open focus-coach modal, so follow-up nudges from
     // background checks can be appended to the conversation. Nil when no modal.
     private var focusChatModel: FocusChatModel?
@@ -3798,9 +3831,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let meetingMonitor = MeetingAttentionMonitor()
     private let calendarMonitor = CalendarMonitor()
     private let caffeinator = BreakCaffeinator()
-    private var abandonMenuItem: NSMenuItem?
+    private var pomodoroActionMenuItem: NSMenuItem?
     private var currentTaskMenuItem: NSMenuItem?
-    private var takeBreakNowMenuItem: NSMenuItem?
     // A persistent, non-nagging signal that the coach is broken: the modal is
     // throttled, but this menu row stays until a call succeeds. Clicking it
     // re-opens the full explanation.
@@ -3933,6 +3965,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             pomodoroScheduler.workDurationOverride = availableWorkMinutes()
             pomodoroScheduler.startWork()
+            pomodoroTransitionWindow?.close()
         case "test-coach":
             checkCoachConnection()
         default:
@@ -3978,27 +4011,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: "Experience Sampling")
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Check in now", action: #selector(showIntradayPrompt), keyEquivalent: "c"))
+        menu.addItem(NSMenuItem(title: "Check in now", action: #selector(checkInFromMenu), keyEquivalent: "c"))
         menu.addItem(.separator())
 
-        menu.addItem(NSMenuItem(title: "Start Pomodoro", action: #selector(startPomodoroFromMenu), keyEquivalent: "p"))
+        let pomodoroAction = NSMenuItem(title: "Start Pomodoro", action: #selector(startPomodoroFromMenu), keyEquivalent: "p")
+        pomodoroAction.target = self
+        pomodoroActionMenuItem = pomodoroAction
+        menu.addItem(pomodoroAction)
         let currentTask = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         currentTask.isEnabled = false
         currentTask.isHidden = true
         currentTaskMenuItem = currentTask
         menu.addItem(currentTask)
-        let takeBreakNow = NSMenuItem(title: "Take break now", action: #selector(takeBreakNow), keyEquivalent: "")
-        takeBreakNow.isHidden = true
-        takeBreakNowMenuItem = takeBreakNow
-        menu.addItem(takeBreakNow)
         let completedToday = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         completedToday.isEnabled = false
         completedTodayMenuItem = completedToday
         menu.addItem(completedToday)
-        let abandon = NSMenuItem(title: "Abandon Pomodoro", action: #selector(abandonPomodoro), keyEquivalent: "")
-        abandon.isEnabled = false
-        abandonMenuItem = abandon
-        menu.addItem(abandon)
 
         let coachStatus = NSMenuItem(title: "", action: #selector(showLastCoachError), keyEquivalent: "")
         coachStatus.isHidden = true
@@ -4071,32 +4099,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.doc.horizontal", accessibilityDescription: "Experience Sampling")
                 self.statusItem.button?.title = ""
                 self.statusItem.button?.toolTip = nil
-                self.abandonMenuItem?.isEnabled = false
-                self.currentTaskMenuItem?.isHidden = true
             case .work:
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
                 let secs = seconds % 60
                 self.statusItem.button?.title = String(format: "🍅 %02d:%02d", mins, secs)
-                self.statusItem.button?.toolTip = todo.isEmpty ? nil : "Top to-do: \(todo)"
-                self.abandonMenuItem?.isEnabled = true
-                self.currentTaskMenuItem?.title = "Top to-do: \(todo)"
-                self.currentTaskMenuItem?.isHidden = todo.isEmpty
+                self.statusItem.button?.toolTip = seconds > 0 && !todo.isEmpty ? "Top to-do: \(todo)" : nil
             case .shortBreak, .longBreak:
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
                 let secs = seconds % 60
                 self.statusItem.button?.title = String(format: "☕️ %02d:%02d", mins, secs)
                 self.statusItem.button?.toolTip = "On break"
-                self.abandonMenuItem?.isEnabled = false
-                self.currentTaskMenuItem?.isHidden = true
             }
+            self.updatePomodoroMenuControls()
         }
     }
 
     /// Push a modal onto the stack. The new window appears on top; any windows
     /// beneath stay alive and re-surface as each modal above them closes.
-    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, stealFocus: Bool = false, onClose: (() -> Void)? = nil) {
+    @discardableResult
+    private func showWindow<V: View>(_ view: V, allowClose: Bool = true, stealFocus: Bool = false, onClose: (() -> Void)? = nil) -> NSWindow {
         let hosting = NSHostingView(rootView: view)
         hosting.frame.size = hosting.fittingSize
         var styleMask: NSWindow.StyleMask = [.titled]
@@ -4117,6 +4140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modalDelegates.append(delegate)
         modalStealFocus.append(stealFocus)
         surface(window, stealFocus: stealFocus)
+        return window
     }
 
     // Bring a modal window forward. When `stealFocus` is true it activates the
@@ -4134,6 +4158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Remove a just-closed modal from the stack and bring the new top forward.
     private func handleModalClosed(_ window: NSWindow) {
+        if pomodoroTransitionWindow === window { pomodoroTransitionWindow = nil }
         if let i = modalStack.firstIndex(of: window) {
             modalStack.remove(at: i)
             modalDelegates.remove(at: i)
@@ -4210,7 +4235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Guard against a second prompt stacking on top of the first: paired wake
         // notifications can call this again before the user commits (which is what
         // sets the "already prompted today" flag).
-        guard !startOfDayPromptOpen else { return }
+        guard pomodoroScheduler.phase == .idle, !startOfDayPromptOpen, pomodoroTransitionWindow == nil else { return }
         startOfDayPromptOpen = true
         var committed = false
         let view = CombinedStartOfDayView(
@@ -4241,7 +4266,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func startPomodoroFromMenu() {
+        guard pomodoroScheduler.menuAction == .start else { return }
         startPomodoroNow()
+        pomodoroTransitionWindow?.close()
     }
 
     /// Start a work pomodoro right now, capping the duration if a meeting is
@@ -4251,6 +4278,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// triggers (break/snooze end) go through showPomodoroNext instead.
     private func startPomodoroNow() {
         guard pomodoroScheduler.phase == .idle else { return }
+        resumeTimer?.invalidate()
+        resumeTimer = nil
         pomodoroScheduler.workDurationOverride = availableWorkMinutes()
         pomodoroScheduler.startWork()
     }
@@ -4264,7 +4293,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard pomodoroScheduler.phase == .idle else { return }
         guard workdayHasRoom() else { return }
         deferIfMeeting { [weak self] in
-            guard let self else { return }
+            guard let self, self.pomodoroScheduler.phase == .idle,
+                  self.workdayHasRoom(), !self.startOfDayPromptOpen,
+                  self.pomodoroTransitionWindow == nil else { return }
             let workMins = self.availableWorkMinutes()
             let defaultDuration = self.pomodoroScheduler.workDuration
             var presented = true
@@ -4277,20 +4308,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 workMinutes: workMins < defaultDuration ? workMins : nil,
                 onStartNext: { [weak self] in
                     committed = true
-                    self?.pomodoroScheduler.workDurationOverride = workMins
-                    self?.pomodoroScheduler.startWork()
+                    self?.startPomodoroNow()
                 },
-                onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleSnooze() }
+                onSnooze: { [weak self] in
+                    committed = true
+                    if self?.pomodoroScheduler.phase == .idle { self?.pomodoroScheduler.scheduleSnooze() }
+                }
             )
             // Snooze on any close that isn't an explicit Start/Snooze — covers
             // the native X button, so the prompt is never silently lost.
-            self.showWindow(view, onClose: { [weak self] in
-                if !committed { self?.pomodoroScheduler.scheduleSnooze() }
+            self.pomodoroTransitionWindow = self.showWindow(view, onClose: { [weak self] in
+                if !committed, self?.pomodoroScheduler.phase == .idle { self?.pomodoroScheduler.scheduleSnooze() }
             })
         }
     }
 
     private func showPomodoroBreak() {
+        guard pomodoroScheduler.menuAction == .takeBreak, pomodoroTransitionWindow == nil else { return }
         let isLong = pomodoroScheduler.isLongBreakDue()
         let duration = isLong ? pomodoroScheduler.longBreakDuration : pomodoroScheduler.shortBreakDuration
         var presented = true
@@ -4302,11 +4336,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             isLongBreak: isLong,
             breakDuration: duration,
             snoozeDuration: pomodoroScheduler.breakSnoozeDuration,
-            onStartBreak: { [weak self] in committed = true; self?.pomodoroScheduler.startBreak(isLong: isLong) },
-            onSnooze: { [weak self] in committed = true; self?.pomodoroScheduler.scheduleBreakSnooze() }
+            onStartBreak: { [weak self] in
+                committed = true
+                if self?.pomodoroScheduler.menuAction == .takeBreak { self?.pomodoroScheduler.startBreak(isLong: isLong) }
+            },
+            onSnooze: { [weak self] in
+                committed = true
+                if self?.pomodoroScheduler.menuAction == .takeBreak { self?.pomodoroScheduler.scheduleBreakSnooze() }
+            }
         )
-        showWindow(view, onClose: { [weak self] in
-            if !committed { self?.pomodoroScheduler.scheduleBreakSnooze() }
+        pomodoroTransitionWindow = showWindow(view, onClose: { [weak self] in
+            if !committed, self?.pomodoroScheduler.menuAction == .takeBreak { self?.pomodoroScheduler.scheduleBreakSnooze() }
         })
     }
 
@@ -4369,16 +4409,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showWindow(view)
     }
 
-    // Start the pending break immediately. Used from the menu after the user has
-    // snoozed a break and is now ready — no confirmation modal, since asking to
-    // start the break is itself the confirmation.
+    // Available as soon as work ends, whether the break prompt is open or snoozed.
     @objc private func takeBreakNow() {
-        pomodoroScheduler.cancelBreakSnooze()
+        guard pomodoroScheduler.menuAction == .takeBreak else { return }
         pomodoroScheduler.startBreak(isLong: pomodoroScheduler.isLongBreakDue())
+        pomodoroTransitionWindow?.close()
+    }
+
+    @objc private func endBreakFromMenu() {
+        pomodoroScheduler.endBreak()
+    }
+
+    private func updatePomodoroMenuControls() {
+        let action = pomodoroScheduler.menuAction
+        pomodoroActionMenuItem?.title = action.rawValue
+        pomodoroActionMenuItem?.keyEquivalent = action == .start ? "p" : ""
+        switch action {
+        case .start: pomodoroActionMenuItem?.action = #selector(startPomodoroFromMenu)
+        case .abandon: pomodoroActionMenuItem?.action = #selector(abandonPomodoro)
+        case .takeBreak: pomodoroActionMenuItem?.action = #selector(takeBreakNow)
+        case .endBreak: pomodoroActionMenuItem?.action = #selector(endBreakFromMenu)
+        }
+        currentTaskMenuItem?.title = "Top to-do: \(topTodo)"
+        currentTaskMenuItem?.isHidden = action != .abandon || topTodo.isEmpty
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(showPomodoroStartOfDay) {
+            return pomodoroScheduler.phase == .idle && !startOfDayPromptOpen && pomodoroTransitionWindow == nil
+        }
+        return true
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        takeBreakNowMenuItem?.isHidden = !pomodoroScheduler.isBreakSnoozePending
+        updatePomodoroMenuControls()
         let count = PomodoroDataStore.shared.completedTodayCount(workDuration: pomodoroScheduler.workDuration)
         completedTodayMenuItem?.title = count == 1
             ? "1 pomodoro completed today"
@@ -4386,6 +4450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func abandonPomodoro() {
+        guard pomodoroScheduler.menuAction == .abandon else { return }
         focusMonitor.stop()
         topTodo = ""
         resumeTimer?.invalidate()
@@ -4460,6 +4525,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             quietWeekends: PromptPolicy.weekendQuietMode
         ) else { return }
 
+        checkInFromMenu()
+    }
+
+    @objc private func checkInFromMenu() {
         intradaySnoozeTimer?.invalidate()
         var presented = true
         var committed = false
