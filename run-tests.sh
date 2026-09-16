@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$ROOT_DIR/ExperienceSampling/ExperienceSampling.swift"
+SOURCES=("$ROOT_DIR"/ExperienceSampling/*.swift)
 TST="$ROOT_DIR/ExperienceSamplingTests/main.swift"
 ENV_FILE="$ROOT_DIR/.env"
 BUILD_DIR="$(mktemp -d)"
@@ -24,7 +24,7 @@ if [[ -f "$ENV_FILE" ]]; then set -a; source "$ENV_FILE"; set +a; fi
 echo "==> Building tests"
 swiftc -DTESTING \
   -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio \
-  "$SRC" "$TST" -o "$BIN"
+  "${SOURCES[@]}" "$TST" -o "$BIN"
 
 if [[ -n "${CODESIGN_CERT:-}" ]]; then
   echo "==> Codesigning test binary"

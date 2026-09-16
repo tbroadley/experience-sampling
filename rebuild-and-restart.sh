@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC_FILE="$ROOT_DIR/ExperienceSampling/ExperienceSampling.swift"
+SOURCES=("$ROOT_DIR"/ExperienceSampling/*.swift)
 TMP_APP="/tmp/ExperienceSampling.app"
 TMP_BIN="$TMP_APP/Contents/MacOS/ExperienceSampling"
 DEST_APP="/Applications/ExperienceSampling.app"
@@ -26,7 +26,7 @@ echo "==> Typechecking"
 # -parse-as-library: the entry point is an @main struct (so the source can also
 # be compiled as a library into the test binary); without this flag swiftc treats
 # a lone file as a script and rejects @main.
-swiftc -parse-as-library -typecheck "$SRC_FILE"
+swiftc -parse-as-library -typecheck "${SOURCES[@]}"
 
 if command -v swiftlint >/dev/null 2>&1; then
   echo "==> Linting with swiftlint"
@@ -58,7 +58,7 @@ fi
 
 echo "==> Rebuilding binary into temporary bundle"
 mkdir -p "$(dirname "$TMP_BIN")"
-swiftc -O -parse-as-library -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio "$SRC_FILE" -o "$TMP_BIN"
+swiftc -O -parse-as-library -framework AppKit -framework SwiftUI -framework CoreMediaIO -framework CoreAudio "${SOURCES[@]}" -o "$TMP_BIN"
 
 echo "==> Codesigning temporary app bundle"
 # No --force: the bundle's inner binary was just rebuilt by swiftc above, so it
