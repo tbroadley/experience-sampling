@@ -27,7 +27,9 @@ missing or corrupt objects never silently initialize an empty list.
 
 Appending a task archives the previous document under `<key>.history/` and uses
 an ETag conditional write, retrying conflicts without losing another client's
-edits. A failed archive prevents the write. S3 is the source of truth: edits
+edits. A failed archive prevents the write. Lost write responses are checked by
+reading back the document; unresolved outcomes warn to check the list before
+retrying. S3 is the source of truth: edits
 require connectivity and valid credentials, with no offline queue. Reconfigure
 the same URI after disk failure; restore older snapshots with status-dashboard's
 `task-store restore` command. Bucket versioning is also recommended.

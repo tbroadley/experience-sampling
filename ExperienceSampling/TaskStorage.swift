@@ -20,6 +20,8 @@ enum TaskStorageError: Error {
     case authentication
     case unavailable(String)
     case configuration
+    case requestFailed
+    case unconfirmedWrite
 
     var coachError: CoachError {
         switch self {
@@ -27,6 +29,8 @@ enum TaskStorageError: Error {
         case .authentication: return .tasksAuthRequired("AWS sign-in expired or unavailable. Run `aws sso login`.")
         case .unavailable(let detail): return .tasksUnavailable(detail)
         case .configuration: return .tasksNotConfigured("Set TASKS_S3_URI to an s3://bucket/key object URI.")
+        case .requestFailed: return .tasksUnavailable("AWS request could not complete; check your sign-in and connectivity.")
+        case .unconfirmedWrite: return .tasksUnavailable("Save outcome unknown: it may have reached S3. Refresh the task list before retrying.")
         }
     }
 
@@ -41,7 +45,7 @@ enum TaskStorageError: Error {
         }
         if text.contains("accessdenied") { return .unavailable("AWS denied access; check your sign-in and task storage configuration.") }
         if text.contains("unknown options") { return .unavailable("Update the AWS CLI: conditional S3 writes are required.") }
-        return .unavailable("S3 request failed; check storage configuration and connectivity.")
+        return .requestFailed
     }
 }
 
@@ -73,7 +77,7 @@ enum TaskCommand {
         if finished.wait(timeout: .now() + 40) == .timedOut {
             process.terminate()
             if finished.wait(timeout: .now() + 1) == .timedOut { kill(process.processIdentifier, SIGKILL) }
-            throw TaskStorageError.unavailable("AWS request timed out; check your sign-in and connectivity.")
+            throw TaskStorageError.requestFailed
         }
         return (process.terminationStatus, try Data(contentsOf: output), try Data(contentsOf: errors))
     }
@@ -132,7 +136,7 @@ struct S3TaskStore {
         let (status, output, errors) = try run(args)
         guard status == 0 else { throw TaskStorageError.from(stderr: String(data: errors, encoding: .utf8) ?? "") }
         guard let metadata = try? JSONSerialization.jsonObject(with: output) as? [String: Any] else {
-            throw TaskStorageError.unavailable("AWS CLI returned invalid metadata.")
+            throw TaskStorageError.requestFailed
         }
         return metadata
     }
@@ -172,7 +176,10 @@ struct S3TaskStore {
             do {
                 try put(key: key, data: data, condition: ["--if-match", snapshot.etag])
                 return
-            } catch TaskStorageError.conflict { continue }
+            } catch TaskStorageError.conflict { continue } catch TaskStorageError.requestFailed {
+                if let confirmed = try? read(), confirmed.document.rows == document.rows { return }
+                throw TaskStorageError.unconfirmedWrite
+            }
         }
         throw TaskStorageError.conflict
     }

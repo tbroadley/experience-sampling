@@ -2396,7 +2396,7 @@ final class FocusMonitor {
 
                 if toolName == "create_todo", let todo = input["content"] as? String {
                     TasksClient.createTask(content: todo) { ok in
-                        continueWith(ok ? "Added \"\(todo)\" to today's list." : "Failed to add the to-do — tell the user to add it manually.")
+                        continueWith(ok ? "Added \"\(todo)\" to today's list." : "Save not confirmed; it may have reached storage. Check the task list before retrying or adding manually.")
                     }
                 } else {
                     continueWith("done")

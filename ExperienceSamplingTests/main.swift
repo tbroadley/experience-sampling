@@ -910,6 +910,27 @@ do {
     checkEqual(backups.first, original, "previous data is archived before updating")
     checkEqual(commands.count, 6, "conflict retries read, archive, and conditional write")
 
+    current = original
+    var lostResponse = false
+    let uncertain = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        let key = args[args.firstIndex(of: "--key")! + 1]
+        if args[1] == "get-object" {
+            try current.write(to: URL(fileURLWithPath: args[args.firstIndex(of: "--key")! + 2]))
+            return (0, Data("{\"ETag\":\"etag\"}".utf8), Data())
+        }
+        if !key.contains(".history/") {
+            current = try Data(contentsOf: URL(fileURLWithPath: args[args.firstIndex(of: "--body")! + 1]))
+            lostResponse = true
+            return (1, Data(), Data("connection reset".utf8))
+        }
+        return (0, Data("{}".utf8), Data())
+    })
+    try uncertain.append(row: added)
+    check(lostResponse, "lost response path was exercised")
+    checkEqual(try TaskDocument.decode(current).rows.count, 2, "readback confirms an uncertain write without duplicating it")
+    checkEqual(TaskStorageError.from(stderr: "AccessDenied for AWSReservedSSO_Example").coachError.kind,
+               "tasks-unavailable", "an SSO role ARN does not make an access denial an expired token")
+
     var writes = 0
     let broken = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
         if args[1] == "get-object" { return (1, Data(), Data("NoSuchKey".utf8)) }
