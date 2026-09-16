@@ -5,7 +5,7 @@
 # fought. Everything else keeps SwiftLint's defaults.
 
 included:
-  - ExperienceSampling/ExperienceSampling.swift
+  - ExperienceSampling
 
 disabled_rules:
   # Architectural: the app is deliberately one file with large view/manager

@@ -973,7 +973,7 @@ final class CalendarMonitor {
                   let paramString = String(data: encoded, encoding: .utf8) else { return }
 
             let json: [String: Any]
-            switch TasksClient.runGws(["calendar", "events", "list", "--params", paramString]) {
+            switch CalendarCLI.runGws(["calendar", "events", "list", "--params", paramString]) {
             case .success(let payload):
                 json = payload
             case .failure(let error):
@@ -1044,18 +1044,11 @@ final class CalendarMonitor {
         }
     }
 
-    /// Re-labels a generic `TasksClient.runGws` failure as its calendar
-    /// equivalent. Worth doing rather than passing the tasks error straight
-    /// through: a calendar outage surfaced as "can't read the task sheet" sends
-    /// the user to the spreadsheet settings for a problem that lives in the
-    /// OAuth grant.
-    ///
-    /// Pure and static so the mapping is unit-tested without a Google round trip.
     static func calendarError(from error: CoachError) -> CoachError {
         let detail = error.detail
         if looksLikeMissingScope(detail) { return .calendarScopeMissing(detail) }
         switch error {
-        case .tasksAuthRequired: return .calendarAuthRequired(detail)
+        case .calendarAuthRequired: return .calendarAuthRequired(detail)
         default: return .calendarUnavailable(detail)
         }
     }
@@ -1120,7 +1113,7 @@ struct ScreenObservation {
     let topTodo: String
 }
 
-// MARK: - Tasks (Google Sheet)
+// MARK: - Tasks and Calendar clients
 
 struct TaskItem {
     let id: String
@@ -1135,53 +1128,28 @@ struct CompletedTaskItem {
 
 enum TopTodo {
     case todo(TaskItem)
-    case none  // the sheet is readable, but has no qualifying to-do for today
+    case none  // the task store is readable, but has no qualifying to-do for today
     /// Not configured, or the read failed. Carries the reason so the failure is
     /// loud: a broken task source stops every focus check, and silence there is
     /// indistinguishable from a coach that simply has nothing to say.
     case unavailable(CoachError)
 }
 
-/// Reads today's top to-do from the Google Sheet that `tbroadley/status-dashboard`
-/// keeps its task list in (it replaced Todoist there in Aug 2026). Reordering in
-/// the dashboard writes the `order` column, so the two stay in sync through the
-/// sheet itself — no direct coupling.
-///
-/// Access goes through the `gws` CLI, the same way `CalendarMonitor` reads the
-/// calendar and the way status-dashboard's own client works: `gws` owns the
-/// Google auth, so there is no token for this app to hold.
-///
-/// Sheet layout (row 1 is a header, one task per row):
-///
-///     A id | B content | C project | D description | E due
-///     F recurrence | G order | H done | I completed_at
-enum TasksClient {
-    static let sheetName = "Tasks"
-    static let dataRange = "Tasks!A2:I"
-
-    private enum Column {
-        static let id = 0, content = 1, due = 4, order = 6, done = 7, completedAt = 8
+enum TaskConfiguration {
+    static func value(_ key: String, defaultsKey: String) -> String? {
+        let values = [UserDefaults.standard.string(forKey: defaultsKey),
+                      ProcessInfo.processInfo.environment[key], dashboardValue(key)]
+        return values.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
     }
 
-    /// The spreadsheet to read. Deliberately not defaulted in source — this repo
-    /// is public and the sheet ID isn't. Set it with `defaults write
-    /// org.metr.ExperienceSampling tasksSpreadsheetId <id>`, or leave it to the
-    /// `TASKS_SPREADSHEET_ID` line in `~/.config/status-dashboard/.env`, which
-    /// status-dashboard already maintains.
-    static var spreadsheetID: String? {
-        let stored = UserDefaults.standard.string(forKey: "tasksSpreadsheetId")?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let stored, !stored.isEmpty { return stored }
-        return dashboardEnvSpreadsheetID()
-    }
+    static var s3URI: String? { value("TASKS_S3_URI", defaultsKey: "tasksS3URI") }
+    static var region: String? { value("TASKS_AWS_REGION", defaultsKey: "tasksAWSRegion") }
 
-    static var dashboardEnvURL: URL {
-        URL(fileURLWithPath: "\(NSHomeDirectory())/.config/status-dashboard/.env")
-    }
-
-    static func dashboardEnvSpreadsheetID() -> String? {
-        guard let text = try? String(contentsOf: dashboardEnvURL, encoding: .utf8) else { return nil }
-        return parseEnvValue(text, key: "TASKS_SPREADSHEET_ID")
+    static func dashboardValue(_ key: String) -> String? {
+        let config = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"] ?? "\(NSHomeDirectory())/.config"
+        let url = URL(fileURLWithPath: config).appendingPathComponent("status-dashboard/.env")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return parseEnvValue(text, key: key)
     }
 
     /// Minimal `KEY=value` reader — enough for the one line we need, tolerating
@@ -1201,7 +1169,9 @@ enum TasksClient {
         return nil
     }
 
-    // MARK: gws plumbing
+}
+
+enum CalendarCLI {
 
     /// Where to look for gws. A GUI app inherits a bare PATH, so absolute paths
     /// are required; the nvm install moves with every Node upgrade, hence the
@@ -1229,19 +1199,10 @@ enum TasksClient {
 
     /// Runs `gws` and parses its stdout as JSON. Every failure is a `CoachError`
     /// rather than a nil, so callers can't quietly treat "broken" as "nothing here".
-    static func runGws(_ arguments: [String], body: [String: Any]? = nil) -> Result<[String: Any], CoachError> {
+    static func runGws(_ arguments: [String]) -> Result<[String: Any], CoachError> {
+        guard arguments.first == "calendar" else { return .failure(.calendarUnavailable("Only Calendar access is supported.")) }
         guard let gws = findGws() else {
-            return .failure(.tasksUnavailable("gws CLI not found; set `defaults write org.metr.ExperienceSampling gwsPath`"))
-        }
-
-        var arguments = arguments
-        if let body {
-            // gws takes the request body as a --json argument, not on stdin.
-            guard let encoded = try? JSONSerialization.data(withJSONObject: body),
-                  let text = String(data: encoded, encoding: .utf8) else {
-                return .failure(.tasksUnavailable("could not encode the request body"))
-            }
-            arguments += ["--json", text]
+            return .failure(.calendarUnavailable("gws CLI not found; set `defaults write org.metr.ExperienceSampling gwsPath`"))
         }
 
         let process = Process()
@@ -1261,7 +1222,7 @@ enum TasksClient {
         process.standardOutput = out
         process.standardError = err
         do { try process.run() } catch {
-            return .failure(.tasksUnavailable("gws failed to launch: \(error.localizedDescription)"))
+            return .failure(.calendarUnavailable("gws failed to launch: \(error.localizedDescription)"))
         }
 
         // Drain before waiting: a full pipe buffer would deadlock the child.
@@ -1271,10 +1232,10 @@ enum TasksClient {
 
         guard process.terminationStatus == 0 else {
             let detail = "gws \(arguments.first ?? "") exited \(process.terminationStatus): \(stderr.prefix(300))"
-            return .failure(looksLikeAuthFailure(stderr) ? .tasksAuthRequired(detail) : .tasksUnavailable(detail))
+            return .failure(looksLikeAuthFailure(stderr) ? .calendarAuthRequired(detail) : .calendarUnavailable(detail))
         }
         guard let json = try? JSONSerialization.jsonObject(with: stdout) as? [String: Any] else {
-            return .failure(.tasksUnavailable("gws returned unparseable output: \(String(data: stdout.prefix(200), encoding: .utf8) ?? "")"))
+            return .failure(.calendarUnavailable("gws returned unparseable output"))
         }
         if let apiError = json["error"] {
             // A missing OAuth scope lands here as a 403 `insufficientPermissions`
@@ -1284,15 +1245,12 @@ enum TasksClient {
             // ~/.config/gws/token_cache.json can keep 403ing after a re-login.
             let text = String(describing: apiError)
             let detail = "gws API error: \(text.prefix(300))"
-            return .failure(looksLikeAuthFailure(text) ? .tasksAuthRequired(detail) : .tasksUnavailable(detail))
+            return .failure(looksLikeAuthFailure(text) ? .calendarAuthRequired(detail) : .calendarUnavailable(detail))
         }
         return .success(json)
     }
 
-    /// Every service this app reads through gws. `gws auth login` with no
-    /// `--services` re-grants a *default* set that omits calendar, so a bare
-    /// re-login silently drops meeting support — always pass the full list.
-    static let requiredServices = "drive,gmail,sheets,docs,calendar"
+    static let requiredScope = "https://www.googleapis.com/auth/calendar.readonly"
 
     /// Opens Terminal on the gws re-grant, the same `.command` trick
     /// `HawkAuth.launchInteractiveLogin` uses so no Automation permission is
@@ -1305,9 +1263,9 @@ enum TasksClient {
         let cache = "\(NSHomeDirectory())/.config/gws/token_cache.json"
         let script = """
         #!/bin/bash
-        echo "Re-authorising Google for Experience Sampling (including calendar)…"
+        echo "Re-authorising read-only Calendar access…"
         PATH="\((path as NSString).deletingLastPathComponent):$PATH" \
-        "\(path)" auth login --services \(requiredServices)
+        "\(path)" auth login --scopes \(requiredScope) || exit $?
         rm -f "\(cache)"
         echo
         echo "Done — you can close this window. The calendar refreshes within 5 minutes."
@@ -1326,30 +1284,26 @@ enum TasksClient {
                 "no token", "login", "401", "403"].contains { lowered.contains($0) }
     }
 
-    /// The whole `Tasks` sheet as rows, padded so short rows (Sheets omits
-    /// trailing empties) can be indexed without a bounds check.
-    static func loadRows() -> Result<[[String]], CoachError> {
-        guard let spreadsheetID else {
-            return .failure(.tasksNotConfigured("no spreadsheet ID in defaults or \(dashboardEnvURL.path)"))
-        }
-        let params = ["spreadsheetId": spreadsheetID, "range": dataRange]
-        guard let encoded = try? JSONSerialization.data(withJSONObject: params),
-              let paramString = String(data: encoded, encoding: .utf8) else {
-            return .failure(.tasksUnavailable("could not encode the values.get params"))
-        }
-        return runGws(["sheets", "spreadsheets", "values", "get", "--params", paramString]).flatMap { json in
-            guard let values = json["values"] as? [[String]] else {
-                // An empty sheet legitimately omits "values" entirely.
-                return .success([])
-            }
-            return .success(values.map { row in
-                row.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    + Array(repeating: "", count: max(0, columnCount - row.count))
-            })
-        }
+}
+
+enum TasksClient {
+    private enum Column {
+        static let id = 0, content = 1, due = 4, order = 6, done = 7, completedAt = 8
     }
 
-    private static let columnCount = 9
+    static func storageResult<T>(_ operation: () throws -> T) -> Result<T, CoachError> {
+        do { return .success(try operation()) } catch let error as TaskStorageError {
+            return .failure(error.coachError)
+        } catch { return .failure(.tasksUnavailable("Local task storage I/O failed.")) }
+    }
+
+    static func loadRows() -> Result<[[String]], CoachError> {
+        storageResult {
+            try S3TaskStore.configured().read().document.rows.map { row in
+                row.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            }
+        }
+    }
 
     // MARK: Reads
 
@@ -1415,23 +1369,8 @@ enum TasksClient {
 
     static func createTask(content: String, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .utility).async {
-            guard let spreadsheetID else { completion(false); return }
-            let params: [String: Any] = [
-                "spreadsheetId": spreadsheetID,
-                "range": "\(sheetName)!A:I",
-                "valueInputOption": "RAW",
-                "insertDataOption": "INSERT_ROWS"
-            ]
-            guard let encoded = try? JSONSerialization.data(withJSONObject: params),
-                  let paramString = String(data: encoded, encoding: .utf8) else {
-                completion(false)
-                return
-            }
             let row = newTaskRow(content: content, id: UUID().uuidString, today: todayString())
-            let result = runGws(
-                ["sheets", "spreadsheets", "values", "append", "--params", paramString],
-                body: ["values": [row]]
-            )
+            let result = storageResult { try S3TaskStore.configured().append(row: row) }
             if case .failure(let error) = result {
                 CoachLog.record(error, context: "create to-do")
             }
@@ -1445,7 +1384,7 @@ enum TasksClient {
         value.trimmingCharacters(in: .whitespaces).uppercased() == "TRUE"
     }
 
-    /// Parses the sheet's date/datetime strings: "2026-08-10" or an ISO datetime
+    /// Parses the shared task date/datetime strings: "2026-08-10" or an ISO datetime
     /// with a local offset, which is what status-dashboard writes.
     static func parseSheetDate(_ raw: String) -> Date? {
         if raw.count == 10 { return dayFormatter.date(from: raw) }
@@ -1496,12 +1435,12 @@ enum CoachError: Error, Equatable {
     /// No proxy base URL configured. Deliberately not defaulted in source — see
     /// `MiddlemanClient.baseURL`.
     case proxyNotConfigured(String)
-    /// No tasks spreadsheet configured. Without a top to-do there is nothing to
+    /// No task storage configured. Without a top to-do there is nothing to
     /// coach against, so this stops the coach just as dead as a missing token.
     case tasksNotConfigured(String)
-    /// The `gws` CLI has no usable Google credentials.
+    /// The AWS CLI has no usable credentials.
     case tasksAuthRequired(String)
-    /// gws missing, the Sheets call failed, or the reply didn't parse.
+    /// AWS CLI missing, S3 request failed, or the document is invalid.
     case tasksUnavailable(String)
     /// The `gws` CLI has no usable Google credentials, so the calendar can't be
     /// read. Distinct from the tasks cases because it takes out a different set
@@ -1541,10 +1480,8 @@ enum CoachError: Error, Equatable {
     var fixAction: FixAction {
         switch self {
         case .hawkMissing, .notAuthenticated, .tokenRejected: return .hawkSignIn
-        case .tasksNotConfigured: return .tasksSettings
-        // All three are fixed by the same re-grant, so they get the same button
-        // rather than asking the user to retype a long `--services` list.
-        case .tasksAuthRequired, .calendarAuthRequired, .calendarScopeMissing: return .gwsSignIn
+        case .tasksNotConfigured, .tasksAuthRequired: return .tasksSettings
+        case .calendarAuthRequired, .calendarScopeMissing: return .gwsSignIn
         default: return .none
         }
     }
@@ -1582,8 +1519,8 @@ enum CoachError: Error, Equatable {
         case .badResponse: return "Focus coach: unexpected reply"
         case .proxyNotConfigured: return "Focus coach: proxy not configured"
         case .tasksNotConfigured: return "Focus coach: no task list configured"
-        case .tasksAuthRequired: return "Focus coach: Google sign-in needed"
-        case .tasksUnavailable: return "Focus coach: can't read the task sheet"
+        case .tasksAuthRequired: return "Focus coach: AWS sign-in needed"
+        case .tasksUnavailable: return "Focus coach: task storage unavailable"
         case .calendarAuthRequired: return "Calendar: Google sign-in needed"
         case .calendarScopeMissing: return "Calendar: permission missing"
         case .calendarUnavailable: return "Calendar: can't read your calendar"
@@ -1617,15 +1554,14 @@ enum CoachError: Error, Equatable {
             """
         case .tasksNotConfigured:
             return """
-            The coach keeps you on the top to-do in your tasks spreadsheet, so \
-            without one it can't check anything at all. Paste the sheet ID into \
-            Settings → Focus (status-dashboard's is in \
-            ~/.config/status-dashboard/.env).
+            Configure the task object's S3 URI in Settings → Focus, or set \
+            TASKS_S3_URI in ~/.config/status-dashboard/.env to share the dashboard's \
+            task list. Initialize or import the list explicitly using task-store.
             """
         case .tasksAuthRequired:
-            return "The gws CLI can't reach Google. Run `gws auth login` in a terminal; the coach picks it up on the next check."
+            return "Run `aws sso login` in a terminal. The AWS CLI owns task-storage authentication; Google sign-in is only for Calendar."
         case .tasksUnavailable:
-            return "Reading the tasks spreadsheet failed. The coach retries on the next check; see coach-errors.log for the detail."
+            return "Reading or updating the S3 task document failed. Check AWS access and connectivity. Existing data is never replaced by an empty list."
         // The calendar advice all names the three features that are down, because
         // their absence is silent: nothing happening is exactly what a quiet
         // calendar looks like, which is how this went unnoticed for days.
@@ -1633,15 +1569,14 @@ enum CoachError: Error, Equatable {
             return """
             The gws CLI can't reach Google, so meeting nudges, meeting-aware \
             pomodoro capping and Meet-link auto-open are all off. Re-authorise \
-            below, or run `gws auth login --services drive,gmail,sheets,docs,calendar`.
+            below, or run `gws auth login --scopes https://www.googleapis.com/auth/calendar.readonly`.
             """
         case .calendarScopeMissing:
             return """
-            Google is signed in but the grant is missing the `calendar` scope, so \
-            meeting nudges, meeting-aware pomodoro capping and Meet-link \
-            auto-open are all off. Plain `gws auth login` does not grant it — \
-            re-authorise below, which asks for calendar too and clears gws's \
-            token cache (it outlives a re-login and would keep failing otherwise).
+            Google is signed in but the `calendar.readonly` permission is missing. Meeting \
+            nudges, meeting-aware pomodoro capping and Meet-link auto-open are off. \
+            Re-authorise below to request only Calendar read access and clear \
+            the stale access-token cache after a successful sign-in.
             """
         case .calendarUnavailable:
             return """
@@ -2131,7 +2066,7 @@ final class FocusMonitor {
         return (stored?.isEmpty == false ? stored! : Self.defaultModel)
     }
 
-    // The current top to-do from the tasks sheet, re-fetched on every check.
+    // The current top to-do from S3, re-fetched on every check.
     private var currentTopTodo: String = ""
     // Today's completed to-dos, re-fetched on every check. Given to the coach so it
     // credits time already spent on finished work instead of scolding for it.
@@ -3262,7 +3197,7 @@ struct SettingsView: View {
     @AppStorage("meetingAllowlist") private var meetingAllowlist = MeetingAttentionMonitor.defaultAllowlist
 
     @State private var selectedTab = 0
-    @AppStorage("tasksSpreadsheetId") private var tasksSpreadsheetId = ""
+    @AppStorage("tasksS3URI") private var tasksS3URI = ""
     // Result of the last "Check connection" — a real round trip to Middleman, so
     // the user can confirm the coach works without waiting for a focus check.
     @State private var claudeStatus: String = ""
@@ -3312,9 +3247,9 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundColor(claudeStatus.isEmpty ? .secondary : (claudeStatusOK ? .green : .red))
                     .fixedSize(horizontal: false, vertical: true)
-                TextField("Tasks spreadsheet ID", text: $tasksSpreadsheetId)
+                TextField("Tasks S3 URI", text: $tasksS3URI)
                 Text(tasksStatus)
-                    .font(.caption).foregroundColor(TasksClient.spreadsheetID == nil ? .red : .secondary)
+                    .font(.caption).foregroundColor(TaskConfiguration.s3URI == nil ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .tabItem { Label("Focus", systemImage: "eye") }
@@ -3367,14 +3302,10 @@ struct SettingsView: View {
         }
     }
 
-    // Empty means "inherit status-dashboard's sheet", which is the normal case —
-    // the two apps deliberately share one list.
     private var tasksStatus: String {
-        if !tasksSpreadsheetId.isEmpty { return "Reading tasks from this sheet." }
-        if let inherited = TasksClient.dashboardEnvSpreadsheetID() {
-            return "Using status-dashboard's sheet (…\(inherited.suffix(6)) from ~/.config/status-dashboard/.env)."
-        }
-        return "No tasks spreadsheet found — the focus coach can't run without one."
+        if !tasksS3URI.isEmpty { return "Using the configured S3 task document. AWS CLI sign-in is required." }
+        if TaskConfiguration.s3URI != nil { return "Sharing the S3 task list configured outside the app." }
+        return "Set TASKS_S3_URI in ~/.config/status-dashboard/.env, or enter an S3 object URI here."
     }
 
 }
@@ -4361,7 +4292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.showSettings()
             },
             onGwsSignIn: { [weak self] in
-                TasksClient.launchInteractiveLogin()
+                CalendarCLI.launchInteractiveLogin()
                 self?.closeTopModal()
             },
             onDismiss: { [weak self] in self?.closeTopModal() }
