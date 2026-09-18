@@ -30,7 +30,7 @@ jobs:
 
       - name: Typecheck app
         # Mirrors the typecheck step in rebuild-and-restart.sh.
-        run: swiftc -parse-as-library -typecheck ExperienceSampling/ExperienceSampling.swift
+        run: swiftc -parse-as-library -typecheck ExperienceSampling/*.swift
 
       - name: Run tests
         # run-tests.sh skips codesigning when CODESIGN_CERT is unset (no Santa

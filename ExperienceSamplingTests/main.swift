@@ -736,7 +736,7 @@ do {
     check(!all.contains { $0.isAuthProblem && $0.isTransient }, "no case is both an auth problem and retried as transient")
 }
 
-section("TasksClient: the sheet is read the way status-dashboard writes it")
+section("TasksClient: the shared task schema matches status-dashboard")
 do {
     // A: id | B: content | C: project | D: description | E: due
     // F: recurrence | G: order | H: done | I: completed_at
@@ -772,24 +772,25 @@ do {
     check(!TasksClient.isTrue("") && !TasksClient.isTrue("FALSE"), "anything else is not done")
 
     let env = """
-    # tasks live in a sheet now
-    export TASKS_SPREADSHEET_ID="sheet-123"
-    LINEAR_BW_ITEM=Linear API key
+    # location is local configuration, never bundled
+    export TASKS_S3_URI="s3://example-bucket/tasks.json"
     """
-    checkEqual(TasksClient.parseEnvValue(env, key: "TASKS_SPREADSHEET_ID"), "sheet-123",
-               "the spreadsheet ID is inherited from status-dashboard's env file")
-    check(TasksClient.parseEnvValue(env, key: "MISSING") == nil, "an absent key reads as nil")
+    checkEqual(TaskConfiguration.parseEnvValue(env, key: "TASKS_S3_URI"), "s3://example-bucket/tasks.json",
+               "the task URI is inherited from status-dashboard's env file")
+    check(TaskConfiguration.parseEnvValue(env, key: "MISSING") == nil, "an absent key reads as nil")
 
-    check(TasksClient.looksLikeAuthFailure("Error: invalid_grant"), "an auth-shaped gws failure is recognised")
-    check(!TasksClient.looksLikeAuthFailure("Error: ENOTFOUND"), "a network failure is not an auth problem")
-    check(TasksClient.looksLikeAuthFailure("{code: 403, reason: insufficientPermissions}"),
+    check(CalendarCLI.looksLikeAuthFailure("Error: invalid_grant"), "an auth-shaped gws failure is recognised")
+    check(!CalendarCLI.looksLikeAuthFailure("Error: ENOTFOUND"), "a network failure is not an auth problem")
+    check(CalendarCLI.looksLikeAuthFailure("{code: 403, reason: insufficientPermissions}"),
           "a missing OAuth scope reads as an auth problem, not a transient one")
+    checkEqual(CalendarCLI.requiredScope, "https://www.googleapis.com/auth/calendar.readonly", "Google is Calendar-read-only")
+    check(CoachError.tasksAuthRequired("x").fixAction != .gwsSignIn, "AWS task errors never reauthorize Google")
 
-    checkEqual(TasksClient.nodeVersionOrder("v24.12.0"), [24, 12, 0], "an nvm directory parses to its components")
-    check(TasksClient.nodeVersionOrder("v9.0.0")
-            .lexicographicallyPrecedes(TasksClient.nodeVersionOrder("v24.12.0")),
-          "v24 outranks v9 — a lexical sort of the raw names would get this backwards")
-    checkEqual(TasksClient.nodeVersionOrder("not-a-version"), [], "a junk directory name sorts last, not crashes")
+    checkEqual(CalendarCLI.nodeVersionOrder("v24.12.0"), [24, 12, 0], "an nvm directory parses to its components")
+    check(CalendarCLI.nodeVersionOrder("v9.0.0")
+            .lexicographicallyPrecedes(CalendarCLI.nodeVersionOrder("v24.12.0")),
+          "v24 outranks v9")
+    checkEqual(CalendarCLI.nodeVersionOrder("not-a-version"), [], "a junk directory name sorts last")
 
     check(CoachError.tasksNotConfigured("x").isAuthProblem, "a missing sheet is not retried in a loop")
     check(CoachError.tasksUnavailable("x").isTransient, "an unreadable sheet is retried")
@@ -810,15 +811,15 @@ do {
     check(!CalendarMonitor.looksLikeMissingScope("gws calendar exited 5: HTTP request failed"),
           "an ordinary failure is not mistaken for a scope problem")
 
-    // runGws classifies a 403 as tasksAuthRequired (looksLikeAuthFailure matches
+    // runGws classifies a 403 as calendarAuthRequired (looksLikeAuthFailure matches
     // "403"), so the scope case has to be picked out of the detail, not the case.
-    checkEqual(CalendarMonitor.calendarError(from: .tasksAuthRequired(scopeDetail)).kind,
+    checkEqual(CalendarMonitor.calendarError(from: .calendarAuthRequired(scopeDetail)).kind,
                "calendar-scope-missing",
                "a scope failure is re-labelled even though runGws called it an auth failure")
-    checkEqual(CalendarMonitor.calendarError(from: .tasksAuthRequired("invalid_grant")).kind,
+    checkEqual(CalendarMonitor.calendarError(from: .calendarAuthRequired("invalid_grant")).kind,
                "calendar-auth-required",
                "a genuine sign-in failure stays an auth failure")
-    checkEqual(CalendarMonitor.calendarError(from: .tasksUnavailable("gws not found")).kind,
+    checkEqual(CalendarMonitor.calendarError(from: .calendarUnavailable("gws not found")).kind,
                "calendar-unavailable",
                "everything else is a plain calendar outage")
 
@@ -990,6 +991,96 @@ do {
     store.backfillLastPlannedMinutes(11)
     checkEqual(store.fetchRecent(limit: 500).first { $0.id == recorded.id }?.plannedMinutes, 50,
                "existing plannedMinutes is left alone")
+}
+
+section("S3 task storage: strict schema, safe writes, and recovery snapshots")
+do {
+    let row = TasksClient.newTaskRow(content: "Unicode 📝", id: "a", today: "2026-09-15")
+    let original = try JSONEncoder().encode(TaskDocument(version: 1, rows: [row]))
+    checkEqual(try TaskDocument.decode(original).rows, [row], "document round trips without losing fields")
+    for data in [Data("{}".utf8), Data("broken".utf8),
+                 try JSONEncoder().encode(TaskDocument(version: 2, rows: [])),
+                 try JSONEncoder().encode(TaskDocument(version: 1, rows: [["short"]])),
+                 try JSONEncoder().encode(TaskDocument(version: 1, rows: [row, row]))] {
+        check((try? TaskDocument.decode(data)) == nil, "invalid schema never becomes an empty list")
+    }
+    for uri in ["", "https://example.com/key", "s3://bucket", "s3://bucket/", "s3://a@bucket/key", "s3://bucket/key?x"] {
+        check((try? S3TaskStore.parseURI(uri)) == nil, "invalid S3 location is rejected")
+    }
+    checkEqual(try S3TaskStore.parseURI("s3://example-bucket/folder/tasks.json").key, "folder/tasks.json", "configured key is preserved")
+    checkEqual(TaskStorageError.from(stderr: "ExpiredToken private-location").coachError.kind, "tasks-auth-required", "AWS expiration is actionable")
+    check(!TaskStorageError.from(stderr: "AccessDenied private-location").coachError.detail.contains("private-location"), "AWS errors do not leak locations")
+
+    var current = original
+    var revision = 1
+    var commands: [[String]] = []
+    var backups: [Data] = []
+    var conflictOnce = true
+    let store = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        commands.append(args)
+        let key = args[args.firstIndex(of: "--key")! + 1]
+        if args[1] == "get-object" {
+            let file = args[args.firstIndex(of: "--key")! + 2]
+            try current.write(to: URL(fileURLWithPath: file))
+            return (0, Data("{\"ETag\":\"revision-\(revision)\"}".utf8), Data())
+        }
+        let body = try Data(contentsOf: URL(fileURLWithPath: args[args.firstIndex(of: "--body")! + 1]))
+        if key.contains(".history/") {
+            check(args.contains("--if-none-match"), "history never overwrites another snapshot")
+            backups.append(body)
+        } else {
+            check(args.contains("--if-match"), "task writes always have a precondition")
+            if conflictOnce {
+                conflictOnce = false
+                var changed = try TaskDocument.decode(current)
+                changed.rows[0][1] = "Concurrent edit"
+                current = try JSONEncoder().encode(changed)
+                revision += 1
+                return (1, Data(), Data("PreconditionFailed".utf8))
+            }
+            checkEqual(args[args.firstIndex(of: "--if-match")! + 1], "revision-2", "retry uses the refreshed ETag")
+            current = body
+        }
+        return (0, Data("{}".utf8), Data())
+    })
+    let added = TasksClient.newTaskRow(content: "New task", id: "b", today: "2026-09-15")
+    try store.append(row: added)
+    checkEqual(try TaskDocument.decode(current).rows.map { $0[0] }, ["a", "b"], "append occurs once across a conflict")
+    checkEqual(try TaskDocument.decode(current).rows[0][1], "Concurrent edit", "concurrent task edits survive")
+    checkEqual(backups.first, original, "previous data is archived before updating")
+    checkEqual(commands.count, 6, "conflict retries read, archive, and conditional write")
+
+    current = original
+    var lostResponse = false
+    let uncertain = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        let key = args[args.firstIndex(of: "--key")! + 1]
+        if args[1] == "get-object" {
+            try current.write(to: URL(fileURLWithPath: args[args.firstIndex(of: "--key")! + 2]))
+            return (0, Data("{\"ETag\":\"etag\"}".utf8), Data())
+        }
+        if !key.contains(".history/") {
+            current = try Data(contentsOf: URL(fileURLWithPath: args[args.firstIndex(of: "--body")! + 1]))
+            lostResponse = true
+            return (1, Data(), Data("connection reset".utf8))
+        }
+        return (0, Data("{}".utf8), Data())
+    })
+    try uncertain.append(row: added)
+    check(lostResponse, "lost response path was exercised")
+    checkEqual(try TaskDocument.decode(current).rows.count, 2, "readback confirms an uncertain write without duplicating it")
+    checkEqual(TaskStorageError.from(stderr: "AccessDenied for AWSReservedSSO_Example").coachError.kind,
+               "tasks-unavailable", "an SSO role ARN does not make an access denial an expired token")
+
+    var writes = 0
+    let broken = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        if args[1] == "get-object" { return (1, Data(), Data("NoSuchKey".utf8)) }
+        writes += 1
+        return (0, Data("{}".utf8), Data())
+    })
+    check((try? broken.append(row: added)) == nil, "missing objects require explicit initialization")
+    checkEqual(writes, 0, "read failure never causes an empty replacement")
+} catch {
+    check(false, "S3 tests threw: \(error)")
 }
 
 // MARK: - Summary
