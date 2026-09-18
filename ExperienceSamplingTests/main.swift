@@ -135,7 +135,8 @@ do {
     s.restoreState()
     check(ended, "onWorkSessionEnd called when elapsed > duration")
     check(UserDefaults.standard.string(forKey: kPhase) == nil, "saved phase cleared")
-    checkEqual(s.phase, .idle, "phase left idle (not restored)")
+    checkEqual(s.phase, .work, "completed work awaits its break, just like live expiry")
+    checkEqual(s.menuAction, .takeBreak, "restored completed work offers Take Break Now, not Start or Abandon")
 }
 
 section("restoreState: expired break ends")
@@ -250,6 +251,131 @@ do {
     s.onBreakStart = { started = true }
     s.restoreState()
     check(!started, "onBreakStart not called for a restored work session")
+}
+
+// MARK: - Pomodoro menu states and transitions
+
+section("Pomodoro menu: exactly one appropriate control in every state")
+do {
+    let cases: [(PomodoroPhase, Int, PomodoroMenuAction)] = [
+        (.idle, 0, .start), (.idle, 300, .start),
+        (.work, 3000, .abandon), (.work, 1, .abandon), (.work, 0, .takeBreak),
+        (.shortBreak, 300, .endBreak), (.shortBreak, 0, .endBreak),
+        (.longBreak, 900, .endBreak), (.longBreak, 0, .endBreak),
+    ]
+    for (phase, seconds, expected) in cases {
+        checkEqual(PomodoroMenuAction.action(phase: phase, secondsRemaining: seconds), expected,
+                   "\(phase) with \(seconds)s remaining offers \(expected.rawValue)")
+    }
+    clearSaved()
+    let s = PomodoroScheduler()
+    s.scheduleSnooze()
+    checkEqual(s.menuAction, .start, "snoozing the next pomodoro still allows an explicit start")
+    s.phase = .work
+    s.timeRemaining = 0
+    s.scheduleBreakSnooze()
+    checkEqual(s.menuAction, .takeBreak, "snoozing a completed pomodoro's break only offers Take Break Now")
+    s.startBreak(isLong: false)
+    check(!s.isBreakSnoozePending, "starting the break cancels its snooze")
+    checkEqual(s.menuAction, .endBreak, "the break replaces Take Break Now with End Break")
+    s.endBreak()
+    checkEqual(s.menuAction, .start, "ending the break restores Start Pomodoro")
+}
+
+section("End Break preserves completed work and uses the normal break-end callback")
+for isLong in [false, true] {
+    clearSaved()
+    let store = PomodoroDataStore.shared
+    let completed = PomodoroSession(startTime: Date(), endTime: Date(), taskDescription: "",
+                                    completed: true, pomodoroNumber: 1, plannedMinutes: 50)
+    store.add(completed)
+    let before = store.completedTodayCount(workDuration: 50)
+    let s = PomodoroScheduler()
+    s.startBreak(isLong: isLong)
+    s.startWork()
+    checkEqual(s.phase, isLong ? .longBreak : .shortBreak, "a stale Start Pomodoro action cannot replace a break")
+    var ended = 0
+    var lastTick: PomodoroPhase?
+    s.onTimerTick = { _, phase in lastTick = phase }
+    s.onBreakEnd = {
+        ended += 1
+        checkEqual(s.phase, .idle, "the break-end callback sees idle")
+    }
+    s.endBreak()
+    checkEqual(ended, 1, "ending a \(isLong ? "long" : "short") break fires the callback once")
+    checkEqual(s.timeRemaining, 0, "ending the break clears remaining time")
+    checkEqual(lastTick, .idle, "the menu-bar icon is refreshed to idle")
+    check(UserDefaults.standard.object(forKey: kPhase) == nil, "the ended break cannot restore after restart")
+    checkEqual(store.completedTodayCount(workDuration: 50), before, "ending a break never removes daily credit")
+    checkEqual(store.fetchRecent(limit: 500).first { $0.id == completed.id }?.endTime, completed.endTime,
+               "ending a break leaves the completed session's end time untouched")
+    s.endBreak()
+    checkEqual(ended, 1, "a repeated/stale End Break action is harmless")
+}
+
+section("Invalid or stale actions cannot restart work or undo a completed session")
+do {
+    clearSaved()
+    let s = PomodoroScheduler()
+    s.startWork()
+    let count = s.pomodoroCount
+    s.startWork()
+    checkEqual(s.pomodoroCount, count, "Start Pomodoro during work cannot start a duplicate session")
+    s.endBreak()
+    checkEqual(s.phase, .work, "End Break during work does nothing")
+    s.abandon()
+    checkEqual(s.phase, .idle, "abandoning active work returns to idle")
+    checkEqual(PomodoroDataStore.shared.fetchRecent().first?.completed, false, "abandoned work stays incomplete")
+
+    let store = PomodoroDataStore.shared
+    let completed = PomodoroSession(startTime: Date(), endTime: Date(), taskDescription: "",
+                                    completed: true, pomodoroNumber: 1, plannedMinutes: 50)
+    store.add(completed)
+    for phase: PomodoroPhase in [.idle, .work, .shortBreak, .longBreak] {
+        s.phase = phase
+        s.timeRemaining = 0
+        s.abandon()
+        checkEqual(store.fetchRecent(limit: 500).first { $0.id == completed.id }?.completed, true,
+                   "abandon from \(phase) without active work cannot undo completion")
+    }
+}
+
+section("Natural work expiry offers a break and keeps completed credit")
+do {
+    clearSaved()
+    let store = PomodoroDataStore.shared
+    let completed = PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                                    pomodoroNumber: 1, plannedMinutes: 45)
+    store.add(completed)
+    let before = store.completedTodayCount(workDuration: 50)
+    setSavedState(phase: "work", startOffset: 0, duration: 1, task: "")
+    let s = PomodoroScheduler()
+    var ended = 0
+    s.onWorkSessionEnd = { ended += 1 }
+    s.restoreState()
+    RunLoop.main.run(until: Date().addingTimeInterval(1.2))
+    checkEqual(ended, 1, "natural work expiry fires once")
+    checkEqual(s.menuAction, .takeBreak, "completed work immediately offers Take Break Now")
+    checkEqual(store.completedTodayCount(workDuration: 50), before + 1, "the 90%-length session now counts")
+    s.abandon()
+    checkEqual(store.completedTodayCount(workDuration: 50), before + 1, "a stale Abandon action cannot undo that credit")
+}
+
+section("Natural break expiry refreshes the menu to idle")
+do {
+    clearSaved()
+    setSavedState(phase: "shortBreak", startOffset: 0, duration: 1, task: "")
+    let s = PomodoroScheduler()
+    var lastTick: PomodoroPhase?
+    var ended = 0
+    s.onTimerTick = { _, phase in lastTick = phase }
+    s.onBreakEnd = { ended += 1 }
+    s.restoreState()
+    RunLoop.main.run(until: Date().addingTimeInterval(1.2))
+    checkEqual(s.phase, .idle, "the break expired")
+    checkEqual(lastTick, .idle, "the last tick is idle, not a break stuck at 00:00")
+    checkEqual(ended, 1, "natural expiry fires the same callback as End Break")
+    checkEqual(s.menuAction, .start, "natural expiry offers Start Pomodoro")
 }
 
 // MARK: - BreakCaffeinator
@@ -610,7 +736,7 @@ do {
     check(!all.contains { $0.isAuthProblem && $0.isTransient }, "no case is both an auth problem and retried as transient")
 }
 
-section("TasksClient: the sheet is read the way status-dashboard writes it")
+section("TasksClient: the shared task schema matches status-dashboard")
 do {
     // A: id | B: content | C: project | D: description | E: due
     // F: recurrence | G: order | H: done | I: completed_at
@@ -646,24 +772,25 @@ do {
     check(!TasksClient.isTrue("") && !TasksClient.isTrue("FALSE"), "anything else is not done")
 
     let env = """
-    # tasks live in a sheet now
-    export TASKS_SPREADSHEET_ID="sheet-123"
-    LINEAR_BW_ITEM=Linear API key
+    # location is local configuration, never bundled
+    export TASKS_S3_URI="s3://example-bucket/tasks.json"
     """
-    checkEqual(TasksClient.parseEnvValue(env, key: "TASKS_SPREADSHEET_ID"), "sheet-123",
-               "the spreadsheet ID is inherited from status-dashboard's env file")
-    check(TasksClient.parseEnvValue(env, key: "MISSING") == nil, "an absent key reads as nil")
+    checkEqual(TaskConfiguration.parseEnvValue(env, key: "TASKS_S3_URI"), "s3://example-bucket/tasks.json",
+               "the task URI is inherited from status-dashboard's env file")
+    check(TaskConfiguration.parseEnvValue(env, key: "MISSING") == nil, "an absent key reads as nil")
 
-    check(TasksClient.looksLikeAuthFailure("Error: invalid_grant"), "an auth-shaped gws failure is recognised")
-    check(!TasksClient.looksLikeAuthFailure("Error: ENOTFOUND"), "a network failure is not an auth problem")
-    check(TasksClient.looksLikeAuthFailure("{code: 403, reason: insufficientPermissions}"),
+    check(CalendarCLI.looksLikeAuthFailure("Error: invalid_grant"), "an auth-shaped gws failure is recognised")
+    check(!CalendarCLI.looksLikeAuthFailure("Error: ENOTFOUND"), "a network failure is not an auth problem")
+    check(CalendarCLI.looksLikeAuthFailure("{code: 403, reason: insufficientPermissions}"),
           "a missing OAuth scope reads as an auth problem, not a transient one")
+    checkEqual(CalendarCLI.requiredScope, "https://www.googleapis.com/auth/calendar.readonly", "Google is Calendar-read-only")
+    check(CoachError.tasksAuthRequired("x").fixAction != .gwsSignIn, "AWS task errors never reauthorize Google")
 
-    checkEqual(TasksClient.nodeVersionOrder("v24.12.0"), [24, 12, 0], "an nvm directory parses to its components")
-    check(TasksClient.nodeVersionOrder("v9.0.0")
-            .lexicographicallyPrecedes(TasksClient.nodeVersionOrder("v24.12.0")),
-          "v24 outranks v9 — a lexical sort of the raw names would get this backwards")
-    checkEqual(TasksClient.nodeVersionOrder("not-a-version"), [], "a junk directory name sorts last, not crashes")
+    checkEqual(CalendarCLI.nodeVersionOrder("v24.12.0"), [24, 12, 0], "an nvm directory parses to its components")
+    check(CalendarCLI.nodeVersionOrder("v9.0.0")
+            .lexicographicallyPrecedes(CalendarCLI.nodeVersionOrder("v24.12.0")),
+          "v24 outranks v9")
+    checkEqual(CalendarCLI.nodeVersionOrder("not-a-version"), [], "a junk directory name sorts last")
 
     check(CoachError.tasksNotConfigured("x").isAuthProblem, "a missing sheet is not retried in a loop")
     check(CoachError.tasksUnavailable("x").isTransient, "an unreadable sheet is retried")
@@ -684,15 +811,15 @@ do {
     check(!CalendarMonitor.looksLikeMissingScope("gws calendar exited 5: HTTP request failed"),
           "an ordinary failure is not mistaken for a scope problem")
 
-    // runGws classifies a 403 as tasksAuthRequired (looksLikeAuthFailure matches
+    // runGws classifies a 403 as calendarAuthRequired (looksLikeAuthFailure matches
     // "403"), so the scope case has to be picked out of the detail, not the case.
-    checkEqual(CalendarMonitor.calendarError(from: .tasksAuthRequired(scopeDetail)).kind,
+    checkEqual(CalendarMonitor.calendarError(from: .calendarAuthRequired(scopeDetail)).kind,
                "calendar-scope-missing",
                "a scope failure is re-labelled even though runGws called it an auth failure")
-    checkEqual(CalendarMonitor.calendarError(from: .tasksAuthRequired("invalid_grant")).kind,
+    checkEqual(CalendarMonitor.calendarError(from: .calendarAuthRequired("invalid_grant")).kind,
                "calendar-auth-required",
                "a genuine sign-in failure stays an auth failure")
-    checkEqual(CalendarMonitor.calendarError(from: .tasksUnavailable("gws not found")).kind,
+    checkEqual(CalendarMonitor.calendarError(from: .calendarUnavailable("gws not found")).kind,
                "calendar-unavailable",
                "everything else is a plain calendar outage")
 
@@ -775,19 +902,21 @@ do {
 
 // MARK: - Daily pomodoro count
 
-section("PomodoroSession.isFullLength: short pomodoros don't count")
+section("PomodoroSession: at least 90% of configured duration counts")
 do {
-    func session(plannedMinutes: Int?) -> PomodoroSession {
-        PomodoroSession(startTime: Date(), taskDescription: "", completed: true,
-                        pomodoroNumber: 1, plannedMinutes: plannedMinutes)
+    let cases: [(Int?, Int, Bool)] = [
+        (44, 50, false), (45, 50, true), (46, 50, true), (47, 50, true),
+        (48, 50, true), (49, 50, true), (50, 50, true), (55, 50, true),
+        (22, 25, false), (23, 25, true), (25, 25, true),
+        (53, 60, false), (54, 60, true), (9, 10, true),
+        (0, 50, false), (nil, 50, true),
+    ]
+    for (planned, configured, expected) in cases {
+        let session = PomodoroSession(startTime: Date(), taskDescription: "", completed: true,
+                                      pomodoroNumber: 1, plannedMinutes: planned)
+        checkEqual(session.meetsDailyCountThreshold(workDuration: configured), expected,
+                   "\(planned.map(String.init) ?? "legacy") minutes against \(configured)-minute setting")
     }
-    check(session(plannedMinutes: 25).isFullLength(workDuration: 25), "a full-length pomodoro counts")
-    check(!session(plannedMinutes: 12).isFullLength(workDuration: 25),
-          "one capped short by a meeting doesn't count")
-    check(session(plannedMinutes: nil).isFullLength(workDuration: 25),
-          "a session recorded before plannedMinutes existed still counts")
-    check(session(plannedMinutes: 30).isFullLength(workDuration: 25),
-          "a longer-than-configured session counts")
 }
 
 section("PomodoroDataStore.completedTodayCount")
@@ -814,6 +943,18 @@ do {
                               completed: false, pomodoroNumber: 4, plannedMinutes: 25))
     store.updateLast(endTime: Date().addingTimeInterval(-48 * 3600), completed: true)
     checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "a pomodoro from two days ago does not")
+
+    let before50 = store.completedTodayCount(workDuration: 50)
+    let cases: [(Int?, Bool, Int)] = [
+        (45, false, 0), (45, true, 1), (44, true, 1), (50, true, 2), (nil, true, 3),
+    ]
+    for (planned, completed, added) in cases {
+        store.add(PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                                  pomodoroNumber: 1, plannedMinutes: planned))
+        store.updateLast(endTime: Date(), completed: completed)
+        checkEqual(store.completedTodayCount(workDuration: 50), before50 + added,
+                   "daily total after \(planned.map(String.init) ?? "legacy") minutes, completed=\(completed)")
+    }
 }
 
 section("A pomodoro started before plannedMinutes existed is backfilled on restore")
@@ -850,6 +991,96 @@ do {
     store.backfillLastPlannedMinutes(11)
     checkEqual(store.fetchRecent(limit: 500).first { $0.id == recorded.id }?.plannedMinutes, 50,
                "existing plannedMinutes is left alone")
+}
+
+section("S3 task storage: strict schema, safe writes, and recovery snapshots")
+do {
+    let row = TasksClient.newTaskRow(content: "Unicode 📝", id: "a", today: "2026-09-15")
+    let original = try JSONEncoder().encode(TaskDocument(version: 1, rows: [row]))
+    checkEqual(try TaskDocument.decode(original).rows, [row], "document round trips without losing fields")
+    for data in [Data("{}".utf8), Data("broken".utf8),
+                 try JSONEncoder().encode(TaskDocument(version: 2, rows: [])),
+                 try JSONEncoder().encode(TaskDocument(version: 1, rows: [["short"]])),
+                 try JSONEncoder().encode(TaskDocument(version: 1, rows: [row, row]))] {
+        check((try? TaskDocument.decode(data)) == nil, "invalid schema never becomes an empty list")
+    }
+    for uri in ["", "https://example.com/key", "s3://bucket", "s3://bucket/", "s3://a@bucket/key", "s3://bucket/key?x"] {
+        check((try? S3TaskStore.parseURI(uri)) == nil, "invalid S3 location is rejected")
+    }
+    checkEqual(try S3TaskStore.parseURI("s3://example-bucket/folder/tasks.json").key, "folder/tasks.json", "configured key is preserved")
+    checkEqual(TaskStorageError.from(stderr: "ExpiredToken private-location").coachError.kind, "tasks-auth-required", "AWS expiration is actionable")
+    check(!TaskStorageError.from(stderr: "AccessDenied private-location").coachError.detail.contains("private-location"), "AWS errors do not leak locations")
+
+    var current = original
+    var revision = 1
+    var commands: [[String]] = []
+    var backups: [Data] = []
+    var conflictOnce = true
+    let store = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        commands.append(args)
+        let key = args[args.firstIndex(of: "--key")! + 1]
+        if args[1] == "get-object" {
+            let file = args[args.firstIndex(of: "--key")! + 2]
+            try current.write(to: URL(fileURLWithPath: file))
+            return (0, Data("{\"ETag\":\"revision-\(revision)\"}".utf8), Data())
+        }
+        let body = try Data(contentsOf: URL(fileURLWithPath: args[args.firstIndex(of: "--body")! + 1]))
+        if key.contains(".history/") {
+            check(args.contains("--if-none-match"), "history never overwrites another snapshot")
+            backups.append(body)
+        } else {
+            check(args.contains("--if-match"), "task writes always have a precondition")
+            if conflictOnce {
+                conflictOnce = false
+                var changed = try TaskDocument.decode(current)
+                changed.rows[0][1] = "Concurrent edit"
+                current = try JSONEncoder().encode(changed)
+                revision += 1
+                return (1, Data(), Data("PreconditionFailed".utf8))
+            }
+            checkEqual(args[args.firstIndex(of: "--if-match")! + 1], "revision-2", "retry uses the refreshed ETag")
+            current = body
+        }
+        return (0, Data("{}".utf8), Data())
+    })
+    let added = TasksClient.newTaskRow(content: "New task", id: "b", today: "2026-09-15")
+    try store.append(row: added)
+    checkEqual(try TaskDocument.decode(current).rows.map { $0[0] }, ["a", "b"], "append occurs once across a conflict")
+    checkEqual(try TaskDocument.decode(current).rows[0][1], "Concurrent edit", "concurrent task edits survive")
+    checkEqual(backups.first, original, "previous data is archived before updating")
+    checkEqual(commands.count, 6, "conflict retries read, archive, and conditional write")
+
+    current = original
+    var lostResponse = false
+    let uncertain = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        let key = args[args.firstIndex(of: "--key")! + 1]
+        if args[1] == "get-object" {
+            try current.write(to: URL(fileURLWithPath: args[args.firstIndex(of: "--key")! + 2]))
+            return (0, Data("{\"ETag\":\"etag\"}".utf8), Data())
+        }
+        if !key.contains(".history/") {
+            current = try Data(contentsOf: URL(fileURLWithPath: args[args.firstIndex(of: "--body")! + 1]))
+            lostResponse = true
+            return (1, Data(), Data("connection reset".utf8))
+        }
+        return (0, Data("{}".utf8), Data())
+    })
+    try uncertain.append(row: added)
+    check(lostResponse, "lost response path was exercised")
+    checkEqual(try TaskDocument.decode(current).rows.count, 2, "readback confirms an uncertain write without duplicating it")
+    checkEqual(TaskStorageError.from(stderr: "AccessDenied for AWSReservedSSO_Example").coachError.kind,
+               "tasks-unavailable", "an SSO role ARN does not make an access denial an expired token")
+
+    var writes = 0
+    let broken = try S3TaskStore(uri: "s3://example-bucket/tasks.json", runner: { args in
+        if args[1] == "get-object" { return (1, Data(), Data("NoSuchKey".utf8)) }
+        writes += 1
+        return (0, Data("{}".utf8), Data())
+    })
+    check((try? broken.append(row: added)) == nil, "missing objects require explicit initialization")
+    checkEqual(writes, 0, "read failure never causes an empty replacement")
+} catch {
+    check(false, "S3 tests threw: \(error)")
 }
 
 // MARK: - Summary

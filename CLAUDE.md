@@ -25,7 +25,8 @@ stores never touch real data. Exit code is non-zero on any failure.
 
 ## Project Structure
 
-- Single-file Swift app: `ExperienceSampling/ExperienceSampling.swift`
+- UI and application logic: `ExperienceSampling/ExperienceSampling.swift`
+- S3 transport and conditional writes: `ExperienceSampling/TaskStorage.swift`
   - Entry point is an `@main struct` guarded by `#if !TESTING`; the app builds
     with `-parse-as-library` so `@main` is valid in a lone file.
 - App bundle info: `ExperienceSampling/Info.plist`
@@ -59,16 +60,28 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
   always empty — the per-pomodoro goal feature was removed). `plannedMinutes`
   records the length the session was *started* with; meeting- and
   workday-aware capping can start one shorter than `pomodoroWorkDuration`, and
-  those short ones are excluded from the "completed today" menu count
-  (`completedTodayCount(workDuration:)`). It's optional: sessions written before
-  the field existed decode as `nil` and count as full length.
-- (no task credentials: the Google Sheet task list is reached via the `gws` CLI,
-  which owns its own auth. A leftover `todoist-api-token.txt` is dead.)
+  sessions at least 90% of the configured duration count in the "completed today"
+  menu total (`completedTodayCount(workDuration:)`), so 45–50 minutes count for
+  a 50-minute setting. Shorter sessions and abandoned work don't. It's optional:
+  sessions written before the field existed decode as `nil` and still count.
+- Task data is in the configured S3 object; the AWS CLI owns credentials.
+  No task credentials or infrastructure identifiers are bundled.
 - `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
 - `coach-errors.log` - one line per focus-coach diagnostic (auth/network/HTTP failures,
   retries, recoveries). Also mirrored to the unified log with an `[FocusCoach]` prefix.
   There is no longer an `anthropic-api-key.txt`; see "Focus coach auth" below.
 - `meeting-attention-log.jsonl` - one line per meeting-drift nudge (`context`, `linger_seconds`)
+
+## Pomodoro dropdown
+
+The timer control is a single menu item selected by `PomodoroMenuAction`:
+idle → Start Pomodoro, active work → Abandon Pomodoro, completed work awaiting
+its break (including snoozed) → Take Break Now, either break → End Break.
+`phase == .work && timeRemaining == 0` means completed work awaiting a break,
+including on restore; it must not be abandoned or restarted as active work.
+`endBreak()` uses the normal break-end callback and leaves session history alone.
+Menu actions dismiss superseded next-work/break prompts without re-snoozing them.
+See the README for the full dropdown inventory.
 
 ## Weekend Quiet Mode
 
@@ -87,16 +100,14 @@ used to build a stack of modals waiting on Monday.
 
 ## Calendar
 
-`CalendarMonitor` reads today's primary-calendar events through the same `gws`
-CLI as the task list (`TasksClient.runGws`), so both share one Google auth and
-one binary lookup. Events drive meeting detection, meeting-aware pomodoro
-capping, and auto-opening a Meet link 60s before a call.
+`CalendarMonitor` reads today's primary-calendar events through `CalendarCLI`.
+It is the only consumer of `gws`; task storage uses AWS independently. Events
+drive meeting detection, meeting-aware pomodoro capping, and Meet-link opening.
 
-**This needs the `calendar` OAuth scope**, which `gws auth login` does *not*
-grant by default. Re-grant without dropping the scopes the coach needs:
+Request only Calendar read access:
 
 ```bash
-gws auth login --services drive,gmail,sheets,docs,calendar
+gws auth login --scopes https://www.googleapis.com/auth/calendar.readonly
 ```
 
 A missing scope comes back as HTTP 403 `insufficientPermissions` **in the
@@ -116,19 +127,12 @@ the exit status. Two traps:
   per kind by `CoachErrorThrottle`. Logging alone wasn't enough: a missing
   `calendar` scope once sat in the log for twelve days because nothing the user
   could see changed.
-- `CalendarMonitor.calendarError(from:)` re-labels the generic `TasksClient`
-  failure as `calendarAuthRequired` / `calendarScopeMissing` /
-  `calendarUnavailable`. Two reasons it can't just pass the tasks error through:
-  the modal would say "can't read the task sheet" for an OAuth problem, and
-  `runGws` classifies a 403 as `tasksAuthRequired` (`looksLikeAuthFailure`
-  matches `"403"`), so the scope case has to be recognised from the *detail
-  text* — `looksLikeMissingScope` — not the error case.
-- The `.gwsSignIn` fix action runs
-  `gws auth login --services drive,gmail,sheets,docs,calendar` in Terminal via a
-  `.command` file (no Automation permission) **and deletes `token_cache.json`**.
-  Don't drop either half: a bare `gws auth login` re-grants without calendar, and
-  the cache outlives the re-login, so skipping the delete makes a correct
-  re-grant still 403.
+- `CalendarMonitor.calendarError(from:)` distinguishes expired logins from
+  missing Calendar permissions by the error detail. Task errors never trigger
+  Google sign-in.
+- The `.gwsSignIn` action requests `calendar.readonly` explicitly and deletes
+  `token_cache.json` only after successful authorization. Never restore the old
+  multi-service grant.
 - The pinned menu-bar row is shared, so both recovery handlers check the
   `calendar-` kind prefix before clearing it. Without that, a coach recovery
   wipes a still-valid calendar warning and vice versa.
@@ -165,39 +169,35 @@ incomplete tasks due on or before today (overdue included) — and keeps the use
 on that. When there is no to-do for today, the coach prompts the user to create
 one and can add it via the `create_todo` tool.
 
-The task list is a **Google Sheet**, read through the `gws` CLI (`TasksClient`).
-It replaced Todoist in Aug 2026, following `tbroadley/status-dashboard`, which
-made the same switch in its `clients/sheets.py` — this app deliberately mirrors
-that module's semantics so the two share one list with no direct coupling.
-Reorder in the dashboard and the coach follows.
+The task list is an **S3 JSON document** shared with `tbroadley/status-dashboard`.
+`TasksClient` keeps task-selection semantics; `S3TaskStore` handles storage.
+Reordering in the dashboard updates the same document the coach reads.
 
-- Sheet layout, row 1 a header:
-  `A id | B content | C project | D description | E due | F recurrence | G order | H done | I completed_at`
-- `gws` owns the Google auth, so there is **no token on disk** for this app.
-  (The old `todoist-api-token.txt` is dead; safe to delete.)
-- The sheet ID is **not hardcoded** — this repo is public. It comes from
-  `defaults write org.metr.ExperienceSampling tasksSpreadsheetId <id>`, falling
-  back to `TASKS_SPREADSHEET_ID` in `~/.config/status-dashboard/.env`, which
-  status-dashboard already maintains. Editable in Settings → Focus.
-- `gws` is found by absolute path (a GUI app has a bare `PATH`), including a scan
-  of `~/.nvm/versions/node/*/bin` since nvm moves it on every Node upgrade;
-  override with `defaults write org.metr.ExperienceSampling gwsPath`.
-  Finding `gws` is only half of it: it's a Node script with a
-  `#!/usr/bin/env node` shebang, so `env` has to find `node` too. `runGws`
-  therefore runs it with a `PATH` led by gws's own directory (for an nvm install
-  that's where its matching node lives) — without that the call fails as
-  `gws sheets exited 127: env: node: No such file or directory`.
-- Completing a **recurring** task rolls its due date forward instead of setting
-  `done`, so recurring work never shows up in "completed today".
+- Version 1 wire format: `{"version":1,"rows":[...]}`, nine string cells per row:
+  `id, content, project, description, due, recurrence, order, done, completed_at`.
+- `TaskConfiguration` resolves app settings, then environment, then the shared
+  dashboard env file. See README for `TASKS_S3_URI`, optional AWS region/CLI, and
+  UserDefaults keys. Never commit real locations, identifiers, credentials, or tasks.
+- Reads validate the schema and require an ETag. Missing/invalid documents fail
+  closed; initialization is an explicit create-only operation in `task-store`.
+- Appends preserve a pre-edit recovery object under `<key>.history/`, then use
+  `If-Match`. Conflicts reread/reapply up to three attempts. Backup failure aborts
+  the edit. Network/auth failures are visible; there is no offline write queue.
+- The AWS CLI owns credentials. `TaskCommand` uses private temporary files and
+  a process deadline; errors omit raw AWS output and private locations.
+- Completing recurring tasks in the dashboard advances the due date instead of
+  setting `done`, so they retain the existing completed-today behavior.
+- `CalendarCLI` still finds `gws` by absolute path and leads PATH with its
+  directory so nvm-installed Node can run. It has no task-storage role.
 
 **Task-list failures are loud too.** No to-do means no check at all, so a dead
 token silently killed the whole coach for days (it looked identical to a coach
 with nothing to say — the exact failure mode this design exists to prevent).
 `TopTodo.unavailable` now carries a `CoachError` — `tasksNotConfigured` /
-`tasksAuthRequired` (gws can't reach Google) / `tasksUnavailable` (gws missing,
-API error, unparseable) — into the same log + modal + menu-bar path as the Claude
+`tasksAuthRequired` (AWS sign-in needed) / `tasksUnavailable` (AWS CLI missing,
+S3 request failed, or invalid document) — into the same log + modal + menu-bar path as the Claude
 errors. `CoachError.fixAction` picks the modal's button: Hawk errors get "Sign in
-to Hawk", a missing sheet gets "Open Settings".
+to Hawk", missing task configuration gets "Open Settings".
 
 **Never-off-task screens.** `classifyUserPrompt` carries an explicit exception
 list to its own "be strict" rule, covering the screens that generated most of the
