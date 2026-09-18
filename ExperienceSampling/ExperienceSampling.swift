@@ -121,6 +121,17 @@ final class DataStore {
     }
 }
 
+enum PomodoroMilestone {
+    static func playIfDue(completedToday: Int, now: Date = Date(), defaults: UserDefaults = .standard, play: () -> Bool) -> Bool {
+        guard completedToday == 5 else { return false }
+        if let lastPlayed = defaults.object(forKey: "milestoneSoundLastPlayed") as? Date,
+           Calendar.current.isDate(lastPlayed, inSameDayAs: now) { return false }
+        guard play() else { return false }
+        defaults.set(now, forKey: "milestoneSoundLastPlayed")
+        return true
+    }
+}
+
 // MARK: - Pomodoro Data Store
 
 final class PomodoroDataStore {
@@ -3900,6 +3911,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             pomodoroScheduler.workDurationOverride = availableWorkMinutes()
             pomodoroScheduler.startWork()
             pomodoroTransitionWindow?.close()
+        case "test-milestone-sound":
+            playMilestoneSound()
         case "test-coach":
             checkCoachConnection()
         default:
@@ -3979,6 +3992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Show Meeting Nudge", action: #selector(debugShowMeetingNudge), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Test Coach Connection", action: #selector(checkCoachConnection), keyEquivalent: ""))
+        debug.addItem(NSMenuItem(title: "Test Milestone Sound", action: #selector(playMilestoneSound), keyEquivalent: ""))
         let debugItem = NSMenuItem(title: "Debug", action: nil, keyEquivalent: "")
         debugItem.submenu = debug
         menu.addItem(debugItem)
@@ -4375,9 +4389,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return true
     }
 
-    // Number of completed pomodoros in a day that earns the celebration sound.
-    private static let milestonePomodoroCount = 5
-
     /// Where the celebration sound lives. Deliberately *not* bundled: this repo is
     /// public and the recording is personal. Default is
     /// `~/Library/Application Support/ExperienceSampling/fifth-pomodoro.mp3`;
@@ -4393,25 +4404,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             .appendingPathComponent("fifth-pomodoro.mp3")
     }
 
-    /// Play the celebration sound when the day's pomodoro count reaches the
-    /// milestone. Called from `onWorkSessionEnd`, which runs *after* the session
-    /// has been marked completed, so the finished pomodoro is already counted.
-    /// The `==` (not `>=`) means it fires once a day, on the fifth one only.
     private func playMilestoneSoundIfDue() {
-        // Same count the menu shows — full-length pomodoros only, so a session
-        // cut short by a meeting doesn't quietly earn the sound.
         let completedToday = PomodoroDataStore.shared.completedTodayCount(workDuration: pomodoroScheduler.workDuration)
-        guard completedToday == Self.milestonePomodoroCount else { return }
+        _ = PomodoroMilestone.playIfDue(completedToday: completedToday) {
+            self.playMilestoneSound()
+        }
+    }
+
+    @discardableResult
+    @objc private func playMilestoneSound() -> Bool {
         let url = milestoneSoundURL
         guard let sound = NSSound(contentsOf: url, byReference: true) else {
-            // No sound file installed is a fine, silent-by-choice state, but it
-            // shouldn't be invisible: log it rather than wondering why the
-            // fifth pomodoro passed quietly.
             CoachLog.record("milestone sound not playable at \(url.path)")
-            return
+            return false
         }
         milestoneSound = sound
-        sound.play()
+        guard sound.play() else {
+            CoachLog.record("milestone sound playback failed at \(url.path)")
+            return false
+        }
+        CoachLog.record("milestone sound playback started")
+        return true
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {

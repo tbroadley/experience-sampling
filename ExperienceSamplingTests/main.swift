@@ -919,6 +919,36 @@ do {
     }
 }
 
+section("PomodoroMilestone: play once per day, only after five qualifying sessions")
+do {
+    let suite = "milestone-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let now = Date()
+    let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: now)!
+    var attempts = 0
+    let play = { attempts += 1; return true }
+    for count in 0..<5 {
+        check(!PomodoroMilestone.playIfDue(completedToday: count, now: now, defaults: defaults, play: play),
+              "count \(count) does not play the sound")
+    }
+    checkEqual(attempts, 0, "no audio is loaded before the milestone")
+    check(!PomodoroMilestone.playIfDue(completedToday: 5, now: now, defaults: defaults, play: { false }),
+          "failed playback is reported")
+    check(defaults.object(forKey: "milestoneSoundLastPlayed") == nil, "failed playback does not consume the milestone")
+    check(PomodoroMilestone.playIfDue(completedToday: 5, now: now, defaults: defaults, play: play),
+          "the fifth qualifying session plays the sound")
+    let reopened = UserDefaults(suiteName: suite)!
+    check(!PomodoroMilestone.playIfDue(completedToday: 5, now: now, defaults: reopened, play: play),
+          "a short session leaving the count at five or a restart cannot replay the sound")
+    checkEqual(attempts, 1, "only one playback attempt after success")
+    check(!PomodoroMilestone.playIfDue(completedToday: 6, now: tomorrow, defaults: defaults, play: play),
+          "a later session does not trigger the sound even without a marker for that day")
+    check(PomodoroMilestone.playIfDue(completedToday: 5, now: tomorrow, defaults: defaults, play: play),
+          "the next day's fifth session earns a new sound")
+    checkEqual(attempts, 2, "exactly one successful playback per day")
+}
+
 section("PomodoroDataStore.completedTodayCount")
 do {
     let store = PomodoroDataStore.shared
