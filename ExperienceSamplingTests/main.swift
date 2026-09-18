@@ -1113,6 +1113,17 @@ do {
     check(false, "S3 tests threw: \(error)")
 }
 
+section("BuildInfo: identify the installed source revision")
+do {
+    checkEqual(BuildInfo.label(info: [:]), "Build: unknown", "unstamped builds are explicitly unknown")
+    checkEqual(BuildInfo.label(info: ["ExperienceSamplingGitCommit": ""]), "Build: unknown", "empty revisions are unknown")
+    let info: [String: Any] = ["ExperienceSamplingGitCommit": "0123456789abcdef", "ExperienceSamplingGitDirty": false]
+    checkEqual(BuildInfo.label(info: info), "Build: 0123456789ab", "clean builds show their revision")
+    var modified = info
+    modified["ExperienceSamplingGitDirty"] = true
+    checkEqual(BuildInfo.label(info: modified), "Build: 0123456789ab (modified)", "local modifications are visible")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")

@@ -121,6 +121,18 @@ final class DataStore {
     }
 }
 
+enum BuildInfo {
+    static let current = label(info: Bundle.main.infoDictionary ?? [:])
+
+    static func label(info: [String: Any]) -> String {
+        guard let revision = info["ExperienceSamplingGitCommit"] as? String, !revision.isEmpty else {
+            return "Build: unknown"
+        }
+        let modified = info["ExperienceSamplingGitDirty"] as? Bool ?? false
+        return "Build: \(revision.prefix(12))\(modified ? " (modified)" : "")"
+    }
+}
+
 enum PomodoroMilestone {
     static func playIfDue(completedToday: Int, now: Date = Date(), defaults: UserDefaults = .standard, play: () -> Bool) -> Bool {
         guard completedToday == 5 else { return false }
@@ -3792,6 +3804,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var milestoneSound: NSSound?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        CoachLog.record("app launched — \(BuildInfo.current)")
         setupStatusItem()
         setupMainMenu()
 
@@ -3988,6 +4001,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         menu.addItem(.separator())
 
         let debug = NSMenu()
+        let build = NSMenuItem(title: BuildInfo.current, action: nil, keyEquivalent: "")
+        build.isEnabled = false
+        debug.addItem(build)
+        debug.addItem(.separator())
         debug.addItem(NSMenuItem(title: "Show Pomodoro Start", action: #selector(showPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Show Meeting Nudge", action: #selector(debugShowMeetingNudge), keyEquivalent: ""))

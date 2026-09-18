@@ -98,6 +98,21 @@ See [CLAUDE.md](CLAUDE.md) for architecture notes and gotchas.
 swiftlint lint --strict    # lint (config in .swiftlint.yml)
 ```
 
+The rebuild script stamps the Git revision and whether the worktree is modified
+into the installed bundle. **Debug → Build** and the launch entry in
+`coach-errors.log` identify the running build. Builds without metadata show
+`Build: unknown`. To inspect the full installed revision:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print :ExperienceSamplingGitCommit' \
+  /Applications/ExperienceSampling.app/Contents/Info.plist
+```
+
+The script refreshes `Info.plist` from source, waits for the old process to exit,
+verifies the installed binary and signature, and fails if the new app is not
+running after restart. Building from a clean, up-to-date `main` gives an
+unmodified revision that can be compared directly with `git rev-parse HEAD`.
+
 ## CI
 
 [GitHub Actions](.github/workflows/ci.yml) runs on every push to `main` and on
