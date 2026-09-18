@@ -121,6 +121,18 @@ final class DataStore {
     }
 }
 
+enum BuildInfo {
+    static let current = label(info: Bundle.main.infoDictionary ?? [:])
+
+    static func label(info: [String: Any]) -> String {
+        guard let revision = info["ExperienceSamplingGitCommit"] as? String, !revision.isEmpty else {
+            return "Build: unknown"
+        }
+        let modified = info["ExperienceSamplingGitDirty"] as? Bool ?? false
+        return "Build: \(revision.prefix(12))\(modified ? " (modified)" : "")"
+    }
+}
+
 // MARK: - Pomodoro Data Store
 
 final class PomodoroDataStore {
@@ -3779,6 +3791,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private let snoozeDuration: TimeInterval = 5 * 60
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        CoachLog.record("app launched — \(BuildInfo.current)")
         setupStatusItem()
         setupMainMenu()
 
@@ -3972,6 +3985,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         menu.addItem(.separator())
 
         let debug = NSMenu()
+        let build = NSMenuItem(title: BuildInfo.current, action: nil, keyEquivalent: "")
+        build.isEnabled = false
+        debug.addItem(build)
+        debug.addItem(.separator())
         debug.addItem(NSMenuItem(title: "Show Pomodoro Start", action: #selector(showPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Show Meeting Nudge", action: #selector(debugShowMeetingNudge), keyEquivalent: ""))

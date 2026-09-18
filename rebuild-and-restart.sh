@@ -22,6 +22,13 @@ if [[ -z "${CODESIGN_CERT:-}" ]]; then
   exit 1
 fi
 
+GIT_REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+GIT_DIRTY=false
+if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
+  GIT_DIRTY=true
+fi
+echo "==> Building revision $GIT_REVISION (modified: $GIT_DIRTY)"
+
 echo "==> Typechecking"
 # -parse-as-library: the entry point is an @main struct (so the source can also
 # be compiled as a library into the test binary); without this flag swiftc treats
@@ -53,8 +60,10 @@ if [[ -d "$DEST_APP" ]]; then
   cp -R "$DEST_APP" "$TMP_APP"
 else
   mkdir -p "$TMP_APP/Contents/MacOS"
-  cp "$ROOT_DIR/ExperienceSampling/Info.plist" "$TMP_APP/Contents/Info.plist"
 fi
+cp "$ROOT_DIR/ExperienceSampling/Info.plist" "$TMP_APP/Contents/Info.plist"
+plutil -insert ExperienceSamplingGitCommit -string "$GIT_REVISION" "$TMP_APP/Contents/Info.plist"
+plutil -insert ExperienceSamplingGitDirty -bool "$GIT_DIRTY" "$TMP_APP/Contents/Info.plist"
 
 echo "==> Rebuilding binary into temporary bundle"
 mkdir -p "$(dirname "$TMP_BIN")"
@@ -68,16 +77,28 @@ echo "==> Codesigning temporary app bundle"
 # here. Omitting it avoids Santa --force alerts.
 codesign --sign "$CODESIGN_CERT" "$TMP_APP"
 
+echo "==> Stopping the previous app"
+pkill -x ExperienceSampling || true
+for _ in {1..50}; do
+  if ! pgrep -x ExperienceSampling >/dev/null; then break; fi
+  sleep 0.1
+done
+if pgrep -x ExperienceSampling >/dev/null; then
+  echo "Previous app did not exit; refusing to replace its bundle."
+  exit 1
+fi
+
 echo "==> Installing app bundle"
 rm -rf "$DEST_APP"
 cp -R "$TMP_APP" /Applications/
+cmp "$TMP_BIN" "$DEST_APP/Contents/MacOS/ExperienceSampling"
+codesign --verify --deep --strict "$DEST_APP"
 
 echo "==> Restarting app"
-pkill -x ExperienceSampling || true
-sleep 0.5
 open "$DEST_APP"
+sleep 1
 
 echo "==> Verifying process"
-ps aux | grep -i "ExperienceSampling" | grep -v grep || true
+pgrep -lx ExperienceSampling
 
-echo "Done."
+echo "Done — installed $GIT_REVISION (modified: $GIT_DIRTY)."
