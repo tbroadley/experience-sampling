@@ -135,7 +135,8 @@ do {
     s.restoreState()
     check(ended, "onWorkSessionEnd called when elapsed > duration")
     check(UserDefaults.standard.string(forKey: kPhase) == nil, "saved phase cleared")
-    checkEqual(s.phase, .idle, "phase left idle (not restored)")
+    checkEqual(s.phase, .work, "completed work awaits its break, just like live expiry")
+    checkEqual(s.menuAction, .takeBreak, "restored completed work offers Take Break Now, not Start or Abandon")
 }
 
 section("restoreState: expired break ends")
@@ -250,6 +251,131 @@ do {
     s.onBreakStart = { started = true }
     s.restoreState()
     check(!started, "onBreakStart not called for a restored work session")
+}
+
+// MARK: - Pomodoro menu states and transitions
+
+section("Pomodoro menu: exactly one appropriate control in every state")
+do {
+    let cases: [(PomodoroPhase, Int, PomodoroMenuAction)] = [
+        (.idle, 0, .start), (.idle, 300, .start),
+        (.work, 3000, .abandon), (.work, 1, .abandon), (.work, 0, .takeBreak),
+        (.shortBreak, 300, .endBreak), (.shortBreak, 0, .endBreak),
+        (.longBreak, 900, .endBreak), (.longBreak, 0, .endBreak),
+    ]
+    for (phase, seconds, expected) in cases {
+        checkEqual(PomodoroMenuAction.action(phase: phase, secondsRemaining: seconds), expected,
+                   "\(phase) with \(seconds)s remaining offers \(expected.rawValue)")
+    }
+    clearSaved()
+    let s = PomodoroScheduler()
+    s.scheduleSnooze()
+    checkEqual(s.menuAction, .start, "snoozing the next pomodoro still allows an explicit start")
+    s.phase = .work
+    s.timeRemaining = 0
+    s.scheduleBreakSnooze()
+    checkEqual(s.menuAction, .takeBreak, "snoozing a completed pomodoro's break only offers Take Break Now")
+    s.startBreak(isLong: false)
+    check(!s.isBreakSnoozePending, "starting the break cancels its snooze")
+    checkEqual(s.menuAction, .endBreak, "the break replaces Take Break Now with End Break")
+    s.endBreak()
+    checkEqual(s.menuAction, .start, "ending the break restores Start Pomodoro")
+}
+
+section("End Break preserves completed work and uses the normal break-end callback")
+for isLong in [false, true] {
+    clearSaved()
+    let store = PomodoroDataStore.shared
+    let completed = PomodoroSession(startTime: Date(), endTime: Date(), taskDescription: "",
+                                    completed: true, pomodoroNumber: 1, plannedMinutes: 50)
+    store.add(completed)
+    let before = store.completedTodayCount(workDuration: 50)
+    let s = PomodoroScheduler()
+    s.startBreak(isLong: isLong)
+    s.startWork()
+    checkEqual(s.phase, isLong ? .longBreak : .shortBreak, "a stale Start Pomodoro action cannot replace a break")
+    var ended = 0
+    var lastTick: PomodoroPhase?
+    s.onTimerTick = { _, phase in lastTick = phase }
+    s.onBreakEnd = {
+        ended += 1
+        checkEqual(s.phase, .idle, "the break-end callback sees idle")
+    }
+    s.endBreak()
+    checkEqual(ended, 1, "ending a \(isLong ? "long" : "short") break fires the callback once")
+    checkEqual(s.timeRemaining, 0, "ending the break clears remaining time")
+    checkEqual(lastTick, .idle, "the menu-bar icon is refreshed to idle")
+    check(UserDefaults.standard.object(forKey: kPhase) == nil, "the ended break cannot restore after restart")
+    checkEqual(store.completedTodayCount(workDuration: 50), before, "ending a break never removes daily credit")
+    checkEqual(store.fetchRecent(limit: 500).first { $0.id == completed.id }?.endTime, completed.endTime,
+               "ending a break leaves the completed session's end time untouched")
+    s.endBreak()
+    checkEqual(ended, 1, "a repeated/stale End Break action is harmless")
+}
+
+section("Invalid or stale actions cannot restart work or undo a completed session")
+do {
+    clearSaved()
+    let s = PomodoroScheduler()
+    s.startWork()
+    let count = s.pomodoroCount
+    s.startWork()
+    checkEqual(s.pomodoroCount, count, "Start Pomodoro during work cannot start a duplicate session")
+    s.endBreak()
+    checkEqual(s.phase, .work, "End Break during work does nothing")
+    s.abandon()
+    checkEqual(s.phase, .idle, "abandoning active work returns to idle")
+    checkEqual(PomodoroDataStore.shared.fetchRecent().first?.completed, false, "abandoned work stays incomplete")
+
+    let store = PomodoroDataStore.shared
+    let completed = PomodoroSession(startTime: Date(), endTime: Date(), taskDescription: "",
+                                    completed: true, pomodoroNumber: 1, plannedMinutes: 50)
+    store.add(completed)
+    for phase: PomodoroPhase in [.idle, .work, .shortBreak, .longBreak] {
+        s.phase = phase
+        s.timeRemaining = 0
+        s.abandon()
+        checkEqual(store.fetchRecent(limit: 500).first { $0.id == completed.id }?.completed, true,
+                   "abandon from \(phase) without active work cannot undo completion")
+    }
+}
+
+section("Natural work expiry offers a break and keeps completed credit")
+do {
+    clearSaved()
+    let store = PomodoroDataStore.shared
+    let completed = PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                                    pomodoroNumber: 1, plannedMinutes: 45)
+    store.add(completed)
+    let before = store.completedTodayCount(workDuration: 50)
+    setSavedState(phase: "work", startOffset: 0, duration: 1, task: "")
+    let s = PomodoroScheduler()
+    var ended = 0
+    s.onWorkSessionEnd = { ended += 1 }
+    s.restoreState()
+    RunLoop.main.run(until: Date().addingTimeInterval(1.2))
+    checkEqual(ended, 1, "natural work expiry fires once")
+    checkEqual(s.menuAction, .takeBreak, "completed work immediately offers Take Break Now")
+    checkEqual(store.completedTodayCount(workDuration: 50), before + 1, "the 90%-length session now counts")
+    s.abandon()
+    checkEqual(store.completedTodayCount(workDuration: 50), before + 1, "a stale Abandon action cannot undo that credit")
+}
+
+section("Natural break expiry refreshes the menu to idle")
+do {
+    clearSaved()
+    setSavedState(phase: "shortBreak", startOffset: 0, duration: 1, task: "")
+    let s = PomodoroScheduler()
+    var lastTick: PomodoroPhase?
+    var ended = 0
+    s.onTimerTick = { _, phase in lastTick = phase }
+    s.onBreakEnd = { ended += 1 }
+    s.restoreState()
+    RunLoop.main.run(until: Date().addingTimeInterval(1.2))
+    checkEqual(s.phase, .idle, "the break expired")
+    checkEqual(lastTick, .idle, "the last tick is idle, not a break stuck at 00:00")
+    checkEqual(ended, 1, "natural expiry fires the same callback as End Break")
+    checkEqual(s.menuAction, .start, "natural expiry offers Start Pomodoro")
 }
 
 // MARK: - BreakCaffeinator
@@ -776,19 +902,21 @@ do {
 
 // MARK: - Daily pomodoro count
 
-section("PomodoroSession.isFullLength: short pomodoros don't count")
+section("PomodoroSession: at least 90% of configured duration counts")
 do {
-    func session(plannedMinutes: Int?) -> PomodoroSession {
-        PomodoroSession(startTime: Date(), taskDescription: "", completed: true,
-                        pomodoroNumber: 1, plannedMinutes: plannedMinutes)
+    let cases: [(Int?, Int, Bool)] = [
+        (44, 50, false), (45, 50, true), (46, 50, true), (47, 50, true),
+        (48, 50, true), (49, 50, true), (50, 50, true), (55, 50, true),
+        (22, 25, false), (23, 25, true), (25, 25, true),
+        (53, 60, false), (54, 60, true), (9, 10, true),
+        (0, 50, false), (nil, 50, true),
+    ]
+    for (planned, configured, expected) in cases {
+        let session = PomodoroSession(startTime: Date(), taskDescription: "", completed: true,
+                                      pomodoroNumber: 1, plannedMinutes: planned)
+        checkEqual(session.meetsDailyCountThreshold(workDuration: configured), expected,
+                   "\(planned.map(String.init) ?? "legacy") minutes against \(configured)-minute setting")
     }
-    check(session(plannedMinutes: 25).isFullLength(workDuration: 25), "a full-length pomodoro counts")
-    check(!session(plannedMinutes: 12).isFullLength(workDuration: 25),
-          "one capped short by a meeting doesn't count")
-    check(session(plannedMinutes: nil).isFullLength(workDuration: 25),
-          "a session recorded before plannedMinutes existed still counts")
-    check(session(plannedMinutes: 30).isFullLength(workDuration: 25),
-          "a longer-than-configured session counts")
 }
 
 section("PomodoroDataStore.completedTodayCount")
@@ -815,6 +943,18 @@ do {
                               completed: false, pomodoroNumber: 4, plannedMinutes: 25))
     store.updateLast(endTime: Date().addingTimeInterval(-48 * 3600), completed: true)
     checkEqual(store.completedTodayCount(workDuration: 25), before + 1, "a pomodoro from two days ago does not")
+
+    let before50 = store.completedTodayCount(workDuration: 50)
+    let cases: [(Int?, Bool, Int)] = [
+        (45, false, 0), (45, true, 1), (44, true, 1), (50, true, 2), (nil, true, 3),
+    ]
+    for (planned, completed, added) in cases {
+        store.add(PomodoroSession(startTime: Date(), taskDescription: "", completed: false,
+                                  pomodoroNumber: 1, plannedMinutes: planned))
+        store.updateLast(endTime: Date(), completed: completed)
+        checkEqual(store.completedTodayCount(workDuration: 50), before50 + added,
+                   "daily total after \(planned.map(String.init) ?? "legacy") minutes, completed=\(completed)")
+    }
 }
 
 section("A pomodoro started before plannedMinutes existed is backfilled on restore")

@@ -41,9 +41,10 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
   always empty — the per-pomodoro goal feature was removed). `plannedMinutes`
   records the length the session was *started* with; meeting- and
   workday-aware capping can start one shorter than `pomodoroWorkDuration`, and
-  those short ones are excluded from the "completed today" menu count
-  (`completedTodayCount(workDuration:)`). It's optional: sessions written before
-  the field existed decode as `nil` and count as full length.
+  sessions at least 90% of the configured duration count in the "completed today"
+  menu total (`completedTodayCount(workDuration:)`), so 45–50 minutes count for
+  a 50-minute setting. Shorter sessions and abandoned work don't. It's optional:
+  sessions written before the field existed decode as `nil` and still count.
 - Task data is in the configured S3 object; the AWS CLI owns credentials.
   No task credentials or infrastructure identifiers are bundled.
 - `focus-log.jsonl` - one line per focus check; `task` holds the top to-do at that time
@@ -51,6 +52,17 @@ Data is stored in `~/Library/Application Support/ExperienceSampling/`:
   retries, recoveries). Also mirrored to the unified log with an `[FocusCoach]` prefix.
   There is no longer an `anthropic-api-key.txt`; see "Focus coach auth" below.
 - `meeting-attention-log.jsonl` - one line per meeting-drift nudge (`context`, `linger_seconds`)
+
+## Pomodoro dropdown
+
+The timer control is a single menu item selected by `PomodoroMenuAction`:
+idle → Start Pomodoro, active work → Abandon Pomodoro, completed work awaiting
+its break (including snoozed) → Take Break Now, either break → End Break.
+`phase == .work && timeRemaining == 0` means completed work awaiting a break,
+including on restore; it must not be abandoned or restarted as active work.
+`endBreak()` uses the normal break-end callback and leaves session history alone.
+Menu actions dismiss superseded next-work/break prompts without re-snoozing them.
+See the README for the full dropdown inventory.
 
 ## Weekend Quiet Mode
 
