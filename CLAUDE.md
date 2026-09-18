@@ -33,6 +33,29 @@ stores never touch real data. Exit code is non-zero on any failure.
 - Installed location: `/Applications/ExperienceSampling.app`
 - Tests: `ExperienceSamplingTests/main.swift`, run via `run-tests.sh`
 
+## Fifth-pomodoro sound
+
+Finishing the **fifth** completed pomodoro of a day plays a celebration sound.
+The check lives in the `onWorkSessionEnd` handler (`playMilestoneSoundIfDue`),
+which runs after the session is marked completed, so the just-finished pomodoro
+is already in `PomodoroDataStore.completedTodayCount(workDuration:)` — the same
+90%-duration count the menu shows. `PomodoroMilestone.playIfDue` requires exactly
+five and records successful playback in `milestoneSoundLastPlayed`, so a later
+short session (which leaves the count at five) or a restart cannot play it again
+that day. Failed playback does not consume the milestone.
+The `NSSound` is retained in a property — a deallocated `NSSound` stops
+mid-playback.
+
+The audio file is **not in the repo and not in the app bundle** (this repo is
+public and the recording is personal). It's read at
+`~/Library/Application Support/ExperienceSampling/fifth-pomodoro.mp3`, alongside
+the data stores; override with `defaults write org.metr.ExperienceSampling
+milestoneSoundPath /path/to.mp3`. A missing or unplayable file just means no
+sound, but it's logged to `coach-errors.log` rather than passing silently.
+Debug → Test Milestone Sound (or `experiencesampling://test-milestone-sound`)
+plays the configured file without changing session history or the daily marker.
+Playback starts and failures are logged.
+
 ## Data Storage
 
 Data is stored in `~/Library/Application Support/ExperienceSampling/`:

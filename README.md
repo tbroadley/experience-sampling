@@ -73,6 +73,19 @@ The other dropdown entries are:
 - **Debug** — diagnostic commands remain available; Show Pomodoro Start is
   disabled while a timer or another pomodoro-start/break prompt is active.
 
+## Fifth-pomodoro sound
+
+The fifth qualifying pomodoro of the day plays
+`~/Library/Application Support/ExperienceSampling/fifth-pomodoro.mp3`.
+The sound uses the same 90%-duration threshold as the daily menu count and
+plays at most once per day, including across restarts and later short sessions.
+The recording is local only, never bundled or committed. Override its location
+with `defaults write org.metr.ExperienceSampling milestoneSoundPath /path/to.mp3`.
+
+Use **Debug → Test Milestone Sound** to check playback without changing your
+session count or consuming the milestone. Playback starts, missing files, and
+playback failures are recorded in `coach-errors.log`.
+
 ## Development
 
 The UI and coach live in `ExperienceSampling/ExperienceSampling.swift`;
