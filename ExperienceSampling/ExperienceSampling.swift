@@ -121,6 +121,17 @@ final class DataStore {
     }
 }
 
+enum PomodoroMilestone {
+    static func playIfDue(completedToday: Int, now: Date = Date(), defaults: UserDefaults = .standard, play: () -> Bool) -> Bool {
+        guard completedToday == 5 else { return false }
+        if let lastPlayed = defaults.object(forKey: "milestoneSoundLastPlayed") as? Date,
+           Calendar.current.isDate(lastPlayed, inSameDayAs: now) { return false }
+        guard play() else { return false }
+        defaults.set(now, forKey: "milestoneSoundLastPlayed")
+        return true
+    }
+}
+
 // MARK: - Pomodoro Data Store
 
 final class PomodoroDataStore {
@@ -3777,6 +3788,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     // pomodoro is itself over, so the pomodoro flow resumes after the break.
     private var resumeTimer: Timer?
     private let snoozeDuration: TimeInterval = 5 * 60
+    // Held for the lifetime of the playback: NSSound stops if it's deallocated.
+    private var milestoneSound: NSSound?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
@@ -3805,6 +3818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             guard let self else { return }
             self.focusMonitor.stop()
             self.topTodo = ""
+            self.playMilestoneSoundIfDue()
             // If a calendar block is starting now, don't offer a break: a video
             // meeting passes silently; a non-video block (e.g. "Lunch") shows a
             // notice. Otherwise fall through to the normal break prompt.
@@ -3897,6 +3911,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             pomodoroScheduler.workDurationOverride = availableWorkMinutes()
             pomodoroScheduler.startWork()
             pomodoroTransitionWindow?.close()
+        case "test-milestone-sound":
+            playMilestoneSound()
         case "test-coach":
             checkCoachConnection()
         default:
@@ -3976,6 +3992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         debug.addItem(NSMenuItem(title: "Reset Pomodoro Start", action: #selector(resetPomodoroStartOfDay), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Show Meeting Nudge", action: #selector(debugShowMeetingNudge), keyEquivalent: ""))
         debug.addItem(NSMenuItem(title: "Test Coach Connection", action: #selector(checkCoachConnection), keyEquivalent: ""))
+        debug.addItem(NSMenuItem(title: "Test Milestone Sound", action: #selector(playMilestoneSound), keyEquivalent: ""))
         let debugItem = NSMenuItem(title: "Debug", action: nil, keyEquivalent: "")
         debugItem.submenu = debug
         menu.addItem(debugItem)
@@ -4369,6 +4386,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         if menuItem.action == #selector(showPomodoroStartOfDay) {
             return pomodoroScheduler.phase == .idle && !startOfDayPromptOpen && pomodoroTransitionWindow == nil
         }
+        return true
+    }
+
+    /// Where the celebration sound lives. Deliberately *not* bundled: this repo is
+    /// public and the recording is personal. Default is
+    /// `~/Library/Application Support/ExperienceSampling/fifth-pomodoro.mp3`;
+    /// override with
+    /// `defaults write org.metr.ExperienceSampling milestoneSoundPath /path/to.mp3`.
+    private var milestoneSoundURL: URL {
+        if let override = UserDefaults.standard.string(forKey: "milestoneSoundPath"), !override.isEmpty {
+            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+        }
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport
+            .appendingPathComponent("ExperienceSampling", isDirectory: true)
+            .appendingPathComponent("fifth-pomodoro.mp3")
+    }
+
+    private func playMilestoneSoundIfDue() {
+        let completedToday = PomodoroDataStore.shared.completedTodayCount(workDuration: pomodoroScheduler.workDuration)
+        _ = PomodoroMilestone.playIfDue(completedToday: completedToday) {
+            self.playMilestoneSound()
+        }
+    }
+
+    @discardableResult
+    @objc private func playMilestoneSound() -> Bool {
+        let url = milestoneSoundURL
+        guard let sound = NSSound(contentsOf: url, byReference: true) else {
+            CoachLog.record("milestone sound not playable at \(url.path)")
+            return false
+        }
+        milestoneSound = sound
+        guard sound.play() else {
+            CoachLog.record("milestone sound playback failed at \(url.path)")
+            return false
+        }
+        CoachLog.record("milestone sound playback started")
         return true
     }
 
