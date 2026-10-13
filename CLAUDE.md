@@ -108,6 +108,13 @@ used to build a stack of modals waiting on Monday.
 It is the only consumer of `gws`; task storage uses AWS independently. Events
 drive meeting detection, meeting-aware pomodoro capping, and Meet-link opening.
 
+Events are cached and refreshed every 5 minutes, so anything that *sizes* a
+pomodoro (`startPomodoroNow`, the next-pomodoro prompt, the `start-pomodoro`
+URL) first calls `CalendarMonitor.refreshThen`, which re-reads the calendar and
+runs the action once the new events land or after a 3s timeout with the cache.
+Without it, a meeting moved or deleted moments earlier still capped the new
+pomodoro to the old gap.
+
 Request only Calendar read access:
 
 ```bash

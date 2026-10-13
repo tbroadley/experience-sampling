@@ -1124,6 +1124,33 @@ do {
     checkEqual(BuildInfo.label(info: modified), "Build: 0123456789ab (modified)", "local modifications are visible")
 }
 
+section("CalendarMonitor.runAfterRefresh: start pomodoros on fresh calendar data")
+do {
+    var order: [String] = []
+    CalendarMonitor.runAfterRefresh(timeout: 1, refresh: { done in
+        DispatchQueue.global().async { order.append("refreshed"); done() }
+    }, then: { order.append("action") })
+    RunLoop.main.run(until: Date().addingTimeInterval(1.3))
+    checkEqual(order, ["refreshed", "action"], "a prompt refresh runs the action once, after the new events")
+
+    var runs = 0
+    let start = Date()
+    var ranAfter: TimeInterval = 0
+    CalendarMonitor.runAfterRefresh(timeout: 0.2, refresh: { _ in }, then: {
+        runs += 1; ranAfter = Date().timeIntervalSince(start)
+    })
+    RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+    checkEqual(runs, 1, "a refresh that never finishes falls back to the cache after the timeout")
+    check(ranAfter >= 0.2, "the fallback waits for the timeout (ran after \(ranAfter)s)")
+
+    var lateRuns = 0
+    CalendarMonitor.runAfterRefresh(timeout: 0.1, refresh: { done in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: done)
+    }, then: { lateRuns += 1 })
+    RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+    checkEqual(lateRuns, 1, "a refresh finishing after the timeout doesn't start a second pomodoro")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")
