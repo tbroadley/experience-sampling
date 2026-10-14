@@ -115,6 +115,15 @@ runs the action once the new events land or after a 3s timeout with the cache.
 Without it, a meeting moved or deleted moments earlier still capped the new
 pomodoro to the old gap.
 
+Timed out-of-office events (`eventType == "outOfOffice"`) are kept and flagged
+`isOutOfOffice`. They count wherever pomodoro time is blocked: an upcoming OOO caps
+the pomodoro length (`minutesUntilNextBusy`), and one in progress holds automatic
+prompts until it ends (`isBusy` / `currentBusyEnd`, via `deferIfBusy`). They are
+excluded from the meeting-only behaviour, which goes through `meetings`: Meet-link
+opening, A/V early exit, `isInVideoMeeting`, and the "Lunch"-style notice at
+pomodoro end (a pomodoro ending into OOO goes idle silently). All-day events,
+focus time, and working-location events are still dropped in `parseEvent`.
+
 Request only Calendar read access:
 
 ```bash
