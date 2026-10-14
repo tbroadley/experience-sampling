@@ -1151,6 +1151,51 @@ do {
     checkEqual(lateRuns, 1, "a refresh finishing after the timeout doesn't start a second pomodoro")
 }
 
+section("CalendarMonitor: out-of-office blocks cap and defer pomodoros")
+do {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    func item(_ type: String?, start: String, end: String, allDay: Bool = false) -> [String: Any] {
+        var i: [String: Any] = [
+            "summary": "Block",
+            "start": allDay ? ["date": "2026-10-14"] : ["dateTime": start],
+            "end": allDay ? ["date": "2026-10-15"] : ["dateTime": end],
+        ]
+        if let type { i["eventType"] = type }
+        return i
+    }
+    let s = "2026-10-14T15:00:00Z", e = "2026-10-14T18:00:00Z"
+    let ooo = CalendarMonitor.parseEvent(item("outOfOffice", start: s, end: e), formatter: formatter)
+    check(ooo?.isOutOfOffice == true, "timed OOO events are kept and flagged")
+    check(CalendarMonitor.parseEvent(item(nil, start: s, end: e), formatter: formatter)?.isOutOfOffice == false,
+          "regular events still parse, unflagged")
+    check(CalendarMonitor.parseEvent(item("focusTime", start: s, end: e), formatter: formatter) == nil,
+          "focus time is still dropped")
+    check(CalendarMonitor.parseEvent(item("workingLocation", start: s, end: e), formatter: formatter) == nil,
+          "working location is still dropped")
+    check(CalendarMonitor.parseEvent(item("outOfOffice", start: s, end: e, allDay: true), formatter: formatter) == nil,
+          "all-day OOO is dropped")
+
+    let now = formatter.date(from: "2026-10-14T14:40:00Z")!
+    let oooBlock = ooo!
+    let monitor = CalendarMonitor()
+    monitor.replaceEventsForTesting([oooBlock])
+    checkEqual(monitor.minutesUntilNextBusy(from: now), 20, "an upcoming OOO block caps the pomodoro")
+    check(!monitor.isBusy(at: now), "not busy before the OOO block starts")
+    let during = formatter.date(from: "2026-10-14T16:00:00Z")!
+    check(monitor.isBusy(at: during), "an OOO block in progress holds auto-starts")
+    checkEqual(monitor.currentBusyEnd(at: during), oooBlock.end, "auto-starts resume when the OOO block ends")
+    check(!monitor.isInVideoMeeting(at: during), "OOO isn't a video meeting")
+
+    let meeting = CalendarEvent(summary: "Sync", start: formatter.date(from: "2026-10-14T15:30:00Z")!,
+                                end: formatter.date(from: "2026-10-14T16:30:00Z")!,
+                                meetLink: "https://meet.example/abc", declined: false)
+    monitor.replaceEventsForTesting([meeting, oooBlock])
+    checkEqual(monitor.currentBusyEnd(at: during), oooBlock.end,
+               "overlapping meeting and OOO: wait for whichever ends last")
+    checkEqual(monitor.minutesUntilNextBusy(from: now), 20, "the earliest block wins the cap")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")

@@ -824,6 +824,10 @@ struct CalendarEvent {
     let end: Date
     let meetLink: String?
     let declined: Bool
+    /// Google's `outOfOffice` event type. OOO blocks cap and defer pomodoros
+    /// like meetings, but none of the meeting-only behaviour (Meet-link opening,
+    /// A/V early exit, drift nudges, the "Lunch"-style notice) applies to them.
+    var isOutOfOffice = false
 }
 
 final class CalendarMonitor {
@@ -865,21 +869,35 @@ final class CalendarMonitor {
         meetLinkTimers = []
     }
 
+    /// Everything that blocks pomodoro time: accepted meetings and OOO.
     private var acceptedEvents: [CalendarEvent] { events.filter { !$0.declined } }
+    /// Accepted meetings only — OOO blocks excluded.
+    private var meetings: [CalendarEvent] { acceptedEvents.filter { !$0.isOutOfOffice } }
 
-    func isInMeeting(at date: Date = Date()) -> Bool {
-        guard let meeting = acceptedEvents.first(where: { date >= $0.start && date < $0.end }) else { return false }
-        let meetingKey = "\(meeting.start.timeIntervalSince1970)"
-        return !earlyExitMeetings.contains(meetingKey)
+    /// Accepted events covering `date`, minus meetings left early.
+    private func blockingEvents(at date: Date) -> [CalendarEvent] {
+        acceptedEvents.filter {
+            date >= $0.start && date < $0.end
+            && !earlyExitMeetings.contains("\($0.start.timeIntervalSince1970)")
+        }
     }
 
-    /// Like `isInMeeting`, but only counts events that are actually video meetings
+    #if TESTING
+    func replaceEventsForTesting(_ newEvents: [CalendarEvent]) { events = newEvents }
+    #endif
+
+    /// In a meeting or an OOO block — either way, don't auto-start a pomodoro.
+    func isBusy(at date: Date = Date()) -> Bool {
+        !blockingEvents(at: date).isEmpty
+    }
+
+    /// Like `isBusy`, but only counts events that are actually video meetings
     /// (have a Meet/conference link). The meeting-attention monitor uses this so
     /// non-meeting calendar blocks — "Lunch", phone appointments — don't read as
     /// meetings; combined with Wispr Flow holding the mic, they would otherwise
     /// fire spurious drift nudges.
     func isInVideoMeeting(at date: Date = Date()) -> Bool {
-        guard let meeting = acceptedEvents.first(where: {
+        guard let meeting = meetings.first(where: {
             date >= $0.start && date < $0.end && !($0.meetLink ?? "").isEmpty
         }) else { return false }
         let meetingKey = "\(meeting.start.timeIntervalSince1970)"
@@ -888,7 +906,7 @@ final class CalendarMonitor {
 
     private func checkAVForEarlyExit() {
         let now = Date()
-        guard let meeting = acceptedEvents.first(where: { now >= $0.start && now < $0.end }) else {
+        guard let meeting = meetings.first(where: { now >= $0.start && now < $0.end }) else {
             avInactiveCount = 0
             return
         }
@@ -980,26 +998,25 @@ final class CalendarMonitor {
         return false
     }
 
-    func minutesUntilNextMeeting(from date: Date = Date()) -> Int? {
-        let upcoming = acceptedEvents.filter { $0.start > date }.sorted { $0.start < $1.start }
-        guard let next = upcoming.first else { return nil }
+    /// Minutes until the next meeting or OOO block starts — the pomodoro cap.
+    func minutesUntilNextBusy(from date: Date = Date()) -> Int? {
+        guard let next = acceptedEvents.filter({ $0.start > date }).min(by: { $0.start < $1.start }) else { return nil }
         return Int(next.start.timeIntervalSince(date) / 60)
     }
 
-    func currentMeetingEnd(at date: Date = Date()) -> Date? {
-        acceptedEvents.first { date >= $0.start && date < $0.end }?.end
+    /// When the current meeting/OOO stretch ends (the latest end among the
+    /// overlapping events), so a deferred auto-start waits out all of them.
+    func currentBusyEnd(at date: Date = Date()) -> Date? {
+        blockingEvents(at: date).map(\.end).max()
     }
 
     /// The event we're currently in, or the next one starting within `minutes`.
     /// Used at pomodoro end to decide whether a break should be offered: a video
-    /// meeting (has a meet link) means stay silent, a non-video block ("Lunch")
-    /// means show a notice. `acceptedEvents` already excludes non-`default`
-    /// event types (focusTime, working-location), so those never count.
+    /// meeting (has a meet link) or an OOO block means stay silent, a non-video
+    /// block ("Lunch") means show a notice. Focus-time and working-location
+    /// events are dropped at parse time, so those never count.
     func currentOrImminentEvent(within minutes: Int, from date: Date = Date()) -> CalendarEvent? {
-        if let current = acceptedEvents.first(where: {
-            date >= $0.start && date < $0.end
-            && !earlyExitMeetings.contains("\($0.start.timeIntervalSince1970)")
-        }) {
+        if let current = blockingEvents(at: date).first {
             return current
         }
         let horizon = date.addingTimeInterval(Double(minutes) * 60)
@@ -1077,27 +1094,7 @@ final class CalendarMonitor {
             }
             self.reportCalendarSuccess()
 
-            let parsed: [CalendarEvent] = items.compactMap { item in
-                guard let startObj = item["start"] as? [String: String],
-                      let endObj = item["end"] as? [String: String] else { return nil }
-
-                let startStr = startObj["dateTime"]
-                let endStr = endObj["dateTime"]
-                guard let startStr, let endStr,
-                      let start = formatter.date(from: startStr),
-                      let end = formatter.date(from: endStr) else { return nil }
-
-                let summary = item["summary"] as? String ?? "(no title)"
-                let hangout = item["hangoutLink"] as? String
-                let videoEntry = (((item["conferenceData"] as? [String: Any])?["entryPoints"] as? [[String: Any]])?
-                    .first { $0["entryPointType"] as? String == "video" })?["uri"] as? String
-                let meetLink = hangout ?? videoEntry
-                let eventType = item["eventType"] as? String ?? "default"
-                if eventType != "default" { return nil }
-                let attendees = item["attendees"] as? [[String: Any]] ?? []
-                let declined = attendees.first { $0["self"] as? Bool == true }?["responseStatus"] as? String == "declined"
-                return CalendarEvent(summary: summary, start: start, end: end, meetLink: meetLink, declined: declined)
-            }
+            let parsed = items.compactMap { Self.parseEvent($0, formatter: formatter) }
 
             DispatchQueue.main.async {
                 self.events = parsed
@@ -1106,12 +1103,33 @@ final class CalendarMonitor {
         }
     }
 
+    /// Turns one Calendar API event into a `CalendarEvent`. Keeps regular events
+    /// and timed out-of-office blocks; drops all-day events (no `dateTime`) and
+    /// other types (focusTime, workingLocation), which shouldn't cap pomodoros.
+    static func parseEvent(_ item: [String: Any], formatter: ISO8601DateFormatter) -> CalendarEvent? {
+        let eventType = item["eventType"] as? String ?? "default"
+        guard eventType == "default" || eventType == "outOfOffice" else { return nil }
+        guard let startStr = (item["start"] as? [String: Any])?["dateTime"] as? String,
+              let endStr = (item["end"] as? [String: Any])?["dateTime"] as? String,
+              let start = formatter.date(from: startStr),
+              let end = formatter.date(from: endStr) else { return nil }
+
+        let summary = item["summary"] as? String ?? "(no title)"
+        let hangout = item["hangoutLink"] as? String
+        let videoEntry = (((item["conferenceData"] as? [String: Any])?["entryPoints"] as? [[String: Any]])?
+            .first { $0["entryPointType"] as? String == "video" })?["uri"] as? String
+        let attendees = item["attendees"] as? [[String: Any]] ?? []
+        let declined = attendees.first { $0["self"] as? Bool == true }?["responseStatus"] as? String == "declined"
+        return CalendarEvent(summary: summary, start: start, end: end, meetLink: hangout ?? videoEntry,
+                             declined: declined, isOutOfOffice: eventType == "outOfOffice")
+    }
+
     private func scheduleMeetLinkOpeners() {
         meetLinkTimers.forEach { $0.invalidate() }
         meetLinkTimers = []
 
         let now = Date()
-        for event in acceptedEvents {
+        for event in meetings {
             guard let link = event.meetLink, !link.isEmpty else { continue }
 
             let openKey = "\(link)_\(event.start.timeIntervalSince1970)"
@@ -2813,8 +2831,8 @@ final class MeetingAttentionMonitor {
     // result is cached and refreshed at most this often.
     let contextRefreshInterval: TimeInterval = 20
 
-    /// Whether a scheduled calendar event is happening now. Injected by the app
-    /// (wired to `CalendarMonitor.isInMeeting`) so the monitor stays decoupled.
+    /// Whether a scheduled video meeting is happening now. Injected by the app
+    /// (wired to `CalendarMonitor.isInVideoMeeting`) so the monitor stays decoupled.
     var isInScheduledMeeting: () -> Bool = { false }
 
     var isEnabled: Bool {
@@ -3871,7 +3889,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             // meeting passes silently; a non-video block (e.g. "Lunch") shows a
             // notice. Otherwise fall through to the normal break prompt.
             if let event = self.calendarMonitor.currentOrImminentEvent(within: self.meetingBuffer + 2) {
-                if (event.meetLink ?? "").isEmpty { self.showEventNotice(title: event.summary) }
+                if (event.meetLink ?? "").isEmpty, !event.isOutOfOffice { self.showEventNotice(title: event.summary) }
                 self.pomodoroScheduler.endToIdle()
                 self.scheduleResumeAfterEvent(end: event.end)
             } else {
@@ -4178,21 +4196,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private let minPomodoroDuration = 10
     private let meetingBuffer = 1
 
-    private func deferIfMeeting(action: @escaping () -> Void) {
-        if calendarMonitor.isInMeeting() {
-            if let meetingEnd = calendarMonitor.currentMeetingEnd() {
+    // Holds an automatic pomodoro prompt until any current meeting or OOO block
+    // is over, and while the next one starts too soon to fit a pomodoro.
+    private func deferIfBusy(action: @escaping () -> Void) {
+        if calendarMonitor.isBusy() {
+            if let meetingEnd = calendarMonitor.currentBusyEnd() {
                 let delay = meetingEnd.timeIntervalSince(Date()) + 30
                 Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                    self?.deferIfMeeting(action: action)
+                    self?.deferIfBusy(action: action)
                 }
                 return
             }
         }
 
-        if let minsUntil = calendarMonitor.minutesUntilNextMeeting(), minsUntil < minPomodoroDuration + meetingBuffer {
+        if let minsUntil = calendarMonitor.minutesUntilNextBusy(), minsUntil < minPomodoroDuration + meetingBuffer {
             let delay = Double(minsUntil) * 60 + 30
             Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-                self?.deferIfMeeting(action: action)
+                self?.deferIfBusy(action: action)
             }
             return
         }
@@ -4216,13 +4236,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     // Work minutes for the next pomodoro, capped so it ends by the next meeting
-    // and by the end of the workday — pomodoros never run past quitting time.
+    // or out-of-office block and by the end of the workday — pomodoros never run past quitting time.
     // The workday cap only applies while at least a minPomodoroDuration slice of
     // the day is left; once it's after hours (or under that slice), the cap is
     // skipped so an explicit start still runs a full pomodoro when working late.
     private func availableWorkMinutes() -> Int {
         var cap = pomodoroScheduler.workDuration
-        if let minsUntil = calendarMonitor.minutesUntilNextMeeting() {
+        if let minsUntil = calendarMonitor.minutesUntilNextBusy() {
             cap = min(cap, max(minsUntil - meetingBuffer, minPomodoroDuration))
         }
         let left = minutesUntilEndOfWorkday()
@@ -4295,12 +4315,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     /// Prompt to start the next pomodoro (or snooze) once a break — or a snooze
     /// — ends. Used for automatic triggers where we don't auto-start work: the
     /// modal waits for the user, so the next pomodoro never ticks down while
-    /// they're away from the machine. Defers around meetings, and stops entirely
+    /// they're away from the machine. Defers around meetings and OOO, and stops entirely
     /// once the workday is over so it doesn't keep prompting after hours.
     private func showPomodoroNext() {
         guard pomodoroScheduler.phase == .idle else { return }
         guard workdayHasRoom() else { return }
-        deferIfMeeting { [weak self] in
+        deferIfBusy { [weak self] in
             self?.calendarMonitor.refreshThen { self?.presentPomodoroNext() }
         }
     }
