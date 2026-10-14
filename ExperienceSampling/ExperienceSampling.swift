@@ -1008,9 +1008,41 @@ final class CalendarMonitor {
             .min { $0.start < $1.start }
     }
 
-    func refresh() {
+    /// Re-reads the calendar, then runs `action` on the main queue — once the
+    /// fresh events are in place, or after `timeout` with whatever is cached.
+    /// Pomodoro sizing goes through this: the 5-minute background refresh means
+    /// a meeting moved or deleted moments ago could otherwise still cap a
+    /// new pomodoro to the stale gap. A slow or failing gws can't block the
+    /// start for longer than `timeout`.
+    func refreshThen(timeout: TimeInterval = 3, _ action: @escaping () -> Void) {
+        Self.runAfterRefresh(timeout: timeout, refresh: { done in self.refresh(completion: done) }, then: action)
+    }
+
+    /// Runs `then` exactly once on the main queue: when `refresh` signals
+    /// completion or when `timeout` elapses, whichever comes first.
+    static func runAfterRefresh(
+        timeout: TimeInterval,
+        refresh: (@escaping () -> Void) -> Void,
+        then action: @escaping () -> Void
+    ) {
+        var fired = false
+        let fire = {
+            DispatchQueue.main.async {
+                guard !fired else { return }
+                fired = true
+                action()
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: fire)
+        refresh(fire)
+    }
+
+    /// `completion` runs on the main queue after the events are replaced, or
+    /// after the read fails (leaving the cached events in place).
+    func refresh(completion: (() -> Void)? = nil) {
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
+            guard let self else { DispatchQueue.main.async { completion?() }; return }
+            defer { if completion != nil { DispatchQueue.main.async { completion?() } } }
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime]
             let now = Date()
@@ -3799,6 +3831,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     // Fires the "start next pomodoro" prompt when a meeting/lunch that ended a
     // pomodoro is itself over, so the pomodoro flow resumes after the break.
     private var resumeTimer: Timer?
+    /// Set while `startPomodoroNow` waits on the calendar refresh, so a double
+    /// click (or menu + URL) can't start two pomodoros.
+    private var pomodoroStartPending = false
     private let snoozeDuration: TimeInterval = 5 * 60
     // Held for the lifetime of the playback: NSSound stops if it's deallocated.
     private var milestoneSound: NSSound?
@@ -3921,9 +3956,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 pomodoroScheduler.abandon()
                 caffeinator.sessionEnded()
             }
-            pomodoroScheduler.workDurationOverride = availableWorkMinutes()
-            pomodoroScheduler.startWork()
             pomodoroTransitionWindow?.close()
+            startPomodoroNow()
         case "test-milestone-sound":
             playMilestoneSound()
         case "test-coach":
@@ -4241,12 +4275,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     /// button, dropdown menu) where the user is already asking to start, so
     /// there's no confirmation modal — work begins immediately. Automatic
     /// triggers (break/snooze end) go through showPomodoroNext instead.
+    ///
+    /// The calendar is re-read first (bounded by a short timeout) so the cap
+    /// reflects meetings moved or deleted since the last background refresh.
     private func startPomodoroNow() {
-        guard pomodoroScheduler.phase == .idle else { return }
+        guard pomodoroScheduler.phase == .idle, !pomodoroStartPending else { return }
         resumeTimer?.invalidate()
         resumeTimer = nil
-        pomodoroScheduler.workDurationOverride = availableWorkMinutes()
-        pomodoroScheduler.startWork()
+        pomodoroStartPending = true
+        calendarMonitor.refreshThen { [weak self] in
+            guard let self else { return }
+            self.pomodoroStartPending = false
+            guard self.pomodoroScheduler.phase == .idle else { return }
+            self.pomodoroScheduler.workDurationOverride = self.availableWorkMinutes()
+            self.pomodoroScheduler.startWork()
+        }
     }
 
     /// Prompt to start the next pomodoro (or snooze) once a break — or a snooze
@@ -4258,34 +4301,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         guard pomodoroScheduler.phase == .idle else { return }
         guard workdayHasRoom() else { return }
         deferIfMeeting { [weak self] in
-            guard let self, self.pomodoroScheduler.phase == .idle,
-                  self.workdayHasRoom(), !self.startOfDayPromptOpen,
-                  self.pomodoroTransitionWindow == nil else { return }
-            let workMins = self.availableWorkMinutes()
-            let defaultDuration = self.pomodoroScheduler.workDuration
-            var presented = true
-            var committed = false
-            let view = PomodoroNextView(
-                isPresented: Binding(get: { presented }, set: { [weak self] v in
-                    presented = v; if !v { self?.closeTopModal() }
-                }),
-                snoozeDuration: self.pomodoroScheduler.snoozeDuration,
-                workMinutes: workMins < defaultDuration ? workMins : nil,
-                onStartNext: { [weak self] in
-                    committed = true
-                    self?.startPomodoroNow()
-                },
-                onSnooze: { [weak self] in
-                    committed = true
-                    if self?.pomodoroScheduler.phase == .idle { self?.pomodoroScheduler.scheduleSnooze() }
-                }
-            )
-            // Snooze on any close that isn't an explicit Start/Snooze — covers
-            // the native X button, so the prompt is never silently lost.
-            self.pomodoroTransitionWindow = self.showWindow(view, onClose: { [weak self] in
-                if !committed, self?.pomodoroScheduler.phase == .idle { self?.pomodoroScheduler.scheduleSnooze() }
-            })
+            self?.calendarMonitor.refreshThen { self?.presentPomodoroNext() }
         }
+    }
+
+    private func presentPomodoroNext() {
+        guard pomodoroScheduler.phase == .idle,
+              workdayHasRoom(), !startOfDayPromptOpen,
+              pomodoroTransitionWindow == nil else { return }
+        let workMins = self.availableWorkMinutes()
+        let defaultDuration = self.pomodoroScheduler.workDuration
+        var presented = true
+        var committed = false
+        let view = PomodoroNextView(
+            isPresented: Binding(get: { presented }, set: { [weak self] v in
+                presented = v; if !v { self?.closeTopModal() }
+            }),
+            snoozeDuration: self.pomodoroScheduler.snoozeDuration,
+            workMinutes: workMins < defaultDuration ? workMins : nil,
+            onStartNext: { [weak self] in
+                committed = true
+                self?.startPomodoroNow()
+            },
+            onSnooze: { [weak self] in
+                committed = true
+                if self?.pomodoroScheduler.phase == .idle { self?.pomodoroScheduler.scheduleSnooze() }
+            }
+        )
+        // Snooze on any close that isn't an explicit Start/Snooze — covers
+        // the native X button, so the prompt is never silently lost.
+        self.pomodoroTransitionWindow = self.showWindow(view, onClose: { [weak self] in
+            if !committed, self?.pomodoroScheduler.phase == .idle { self?.pomodoroScheduler.scheduleSnooze() }
+        })
     }
 
     private func showPomodoroBreak() {
