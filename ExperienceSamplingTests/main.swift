@@ -34,8 +34,9 @@ let kStart = "pomodoroPhaseStart"
 let kDuration = "pomodoroPhaseDuration"
 let kLegacyDuration = "pommadoroPhaseDuration"  // old misspelling, migrated away
 let kTask = "pomodoroTask"
+let kPausedRemaining = "pomodoroPausedRemaining"
 let allPomodoroKeys = [
-    kPhase, kStart, kDuration, kLegacyDuration, kTask, "pomodoroCount",
+    kPhase, kStart, kDuration, kLegacyDuration, kTask, kPausedRemaining, "pomodoroCount",
     "pomodoroWorkDuration", "pomodoroShortBreak", "pomodoroLongBreak",
     "pomodoroSnooze", "pomodoroBreakSnooze",
 ]
@@ -251,6 +252,76 @@ do {
     s.onBreakStart = { started = true }
     s.restoreState()
     check(!started, "onBreakStart not called for a restored work session")
+}
+
+section("Pause freezes active work and survives a restart")
+do {
+    clearSaved()
+    setSavedState(phase: "work", startOffset: -100, duration: 300, task: "")
+    let s = PomodoroScheduler()
+    var workStarts = 0
+    s.onWorkStart = { workStarts += 1 }
+    s.restoreState()
+    checkEqual(workStarts, 1, "restoring running work fires onWorkStart")
+    check(s.canTogglePause, "running work can pause")
+    s.pause()
+    check(s.isPaused, "paused")
+    let frozen = s.timeRemaining
+    check(abs(frozen - 200) <= 2, "pause keeps the remaining time (got \(frozen))")
+    checkEqual(s.menuAction, .abandon, "a paused pomodoro can still be abandoned")
+    RunLoop.main.run(until: Date().addingTimeInterval(1.2))
+    checkEqual(s.timeRemaining, frozen, "the countdown does not tick while paused")
+    checkEqual(UserDefaults.standard.integer(forKey: kPausedRemaining), frozen, "paused remaining saved")
+
+    // Simulate a restart long after pausing: wall-clock time must not count.
+    UserDefaults.standard.set(Date().addingTimeInterval(-10_000), forKey: kStart)
+    let r = PomodoroScheduler()
+    var restoredStarts = 0
+    var ended = false
+    r.onWorkStart = { restoredStarts += 1 }
+    r.onWorkSessionEnd = { ended = true }
+    r.restoreState()
+    check(r.isPaused, "restored paused")
+    checkEqual(r.phase, .work, "restored as work")
+    checkEqual(r.timeRemaining, frozen, "restored with the frozen remaining time")
+    check(!ended, "a paused session does not expire across a restart")
+    checkEqual(restoredStarts, 0, "restoring a paused session does not start focus checks")
+
+    r.resume()
+    check(!r.isPaused, "resumed")
+    checkEqual(restoredStarts, 1, "resume fires onWorkStart")
+    check(UserDefaults.standard.object(forKey: kPausedRemaining) == nil, "paused marker cleared on resume")
+    let afterResume = PomodoroScheduler()
+    afterResume.restoreState()
+    check(!afterResume.isPaused, "a resumed session restores running")
+    check(abs(afterResume.timeRemaining - frozen) <= 2, "resume continues from the frozen time (got \(afterResume.timeRemaining))")
+    afterResume.endToIdle()
+}
+
+section("Pause is ignored outside active work; abandon clears it")
+do {
+    clearSaved()
+    let s = PomodoroScheduler()
+    s.pause()
+    check(!s.isPaused, "idle cannot pause")
+    s.startBreak(isLong: false)
+    s.pause()
+    check(!s.isPaused, "a break cannot pause")
+    check(!s.canTogglePause, "no pause control during a break")
+    s.endBreak()
+    s.phase = .work
+    s.timeRemaining = 0
+    check(!s.canTogglePause, "completed work awaiting its break cannot pause")
+    s.endToIdle()
+
+    s.startWork()
+    s.pause()
+    check(s.isPaused, "started work pauses")
+    s.abandon()
+    check(!s.isPaused, "abandon clears pause")
+    checkEqual(s.phase, .idle, "abandon from paused returns to idle")
+    check(UserDefaults.standard.object(forKey: kPausedRemaining) == nil, "paused marker cleared on abandon")
+    checkEqual(PomodoroDataStore.shared.fetchRecent().first?.completed, false, "abandoned paused work stays incomplete")
 }
 
 // MARK: - Pomodoro menu states and transitions
