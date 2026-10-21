@@ -85,6 +85,14 @@ its break (including snoozed) → Take Break Now, either break → End Break.
 including on restore; it must not be abandoned or restarted as active work.
 `endBreak()` uses the normal break-end callback and leaves session history alone.
 Menu actions dismiss superseded next-work/break prompts without re-snoozing them.
+
+Pause is a flag on active work, not a phase: `isPaused` with `phase == .work`
+and a frozen `timeRemaining` (no `phaseStartDate`), persisted as
+`pomodoroPausedRemaining`. `restoreState` restores it frozen without firing
+`onWorkStart`; `resume()` rebases `phaseStartDate` and fires `onWorkStart`, which
+restarts the focus coach and caffeinator. A separate "Pause/Resume Pomodoro"
+item shows whenever `canTogglePause` (`menuAction == .abandon`); a paused
+session can still be abandoned.
 See the README for the full dropdown inventory.
 
 ## Weekend Quiet Mode

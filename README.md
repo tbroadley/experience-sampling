@@ -44,18 +44,26 @@ gws auth login --scopes https://www.googleapis.com/auth/calendar.readonly
 
 ## Dropdown behavior
 
-The timer section shows exactly one control:
+The timer section shows one primary control:
 
 | Timer state | Control | Effect |
 | --- | --- | --- |
 | Idle, including a snoozed next pomodoro or calendar-deferred restart | Start Pomodoro | Starts work immediately, with the usual duration caps |
-| Work running | Abandon Pomodoro | Stops work and records it as incomplete |
+| Work running or paused | Abandon Pomodoro | Stops work and records it as incomplete |
 | Work completed; break prompt open or snoozed | Take Break Now | Starts the short/long break due in the cycle |
 | Short or long break | End Break | Ends the break early and follows the normal next-pomodoro prompt flow |
 
 Ending a break never changes the completed work session. The next-pomodoro
 prompt still respects meetings and working hours; it does not auto-start work.
-Restored timers use the same controls. There is no paused-timer state.
+Restored timers use the same controls.
+
+While work has time left, a second control, **Pause Pomodoro**, appears below it.
+Pausing freezes the countdown (the menu bar shows `⏸ MM:SS`), stops focus-coach
+checks and work-time caffeination, and survives an app restart: time spent
+paused never counts toward the session. **Resume Pomodoro** continues from the
+frozen time. Breaks and completed work awaiting a break cannot be paused. The
+`experiencesampling://pause-pomodoro` and `experiencesampling://resume-pomodoro`
+URLs do the same.
 
 The other dropdown entries are:
 

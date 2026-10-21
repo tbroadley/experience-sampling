@@ -379,6 +379,9 @@ final class PomodoroScheduler: ObservableObject {
     @Published var phase: PomodoroPhase = .idle
     @Published var timeRemaining: Int = 0
     @Published var pomodoroCount: Int = 0  // cycles 1-4
+    /// Active work with its countdown frozen. `phase` stays `.work` and
+    /// `timeRemaining` holds the frozen value; there is no wall-clock start.
+    @Published private(set) var isPaused = false
 
     var workDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroWorkDuration").nonZeroOr(25) }
     var shortBreakDuration: Int { UserDefaults.standard.integer(forKey: "pomodoroShortBreak").nonZeroOr(5) }
@@ -401,6 +404,8 @@ final class PomodoroScheduler: ObservableObject {
     // No longer written; still cleared so stale state from older builds goes away.
     private let taskKey = "pomodoroTask"
     private let countKey = "pomodoroCount"
+    // Seconds left on a paused work session. Present only while paused.
+    private let pausedRemainingKey = "pomodoroPausedRemaining"
 
     var onTimerTick: ((Int, PomodoroPhase) -> Void)?
     var onWorkSessionEnd: (() -> Void)?
@@ -436,6 +441,21 @@ final class PomodoroScheduler: ObservableObject {
         }
 
         let duration = UserDefaults.standard.integer(forKey: phaseDurationKey)
+
+        // A paused session is frozen: restore it as-is, without the wall clock,
+        // and without `onWorkStart` (no focus checks or caffeination while paused).
+        if savedPhase == .work,
+           let paused = UserDefaults.standard.object(forKey: pausedRemainingKey) as? Int, paused > 0 {
+            PomodoroDataStore.shared.backfillLastPlannedMinutes(duration / 60)
+            phase = .work
+            phaseDuration = duration
+            phaseStartDate = nil
+            timeRemaining = min(paused, duration)
+            isPaused = true
+            onTimerTick?(timeRemaining, .work)
+            return
+        }
+
         let elapsed = Int(Date().timeIntervalSince(phaseStart))
         let remaining = duration - elapsed
 
@@ -470,9 +490,15 @@ final class PomodoroScheduler: ObservableObject {
         UserDefaults.standard.set(phaseStartDate ?? Date(), forKey: phaseStartKey)
         UserDefaults.standard.set(phaseDuration, forKey: phaseDurationKey)
         UserDefaults.standard.set(pomodoroCount, forKey: countKey)
+        if isPaused {
+            UserDefaults.standard.set(timeRemaining, forKey: pausedRemainingKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: pausedRemainingKey)
+        }
     }
 
     private func clearSavedState() {
+        UserDefaults.standard.removeObject(forKey: pausedRemainingKey)
         UserDefaults.standard.removeObject(forKey: phaseKey)
         UserDefaults.standard.removeObject(forKey: phaseStartKey)
         UserDefaults.standard.removeObject(forKey: phaseDurationKey)
@@ -481,6 +507,33 @@ final class PomodoroScheduler: ObservableObject {
 
     var menuAction: PomodoroMenuAction {
         PomodoroMenuAction.action(phase: phase, secondsRemaining: timeRemaining)
+    }
+
+    /// Whether the running work countdown can be paused (or, if paused, resumed).
+    var canTogglePause: Bool { menuAction == .abandon }
+
+    /// Freeze the work countdown. Only active work with time left can pause;
+    /// breaks and completed work awaiting a break cannot.
+    func pause() {
+        guard menuAction == .abandon, !isPaused, let start = phaseStartDate else { return }
+        let remaining = phaseDuration - Int(Date().timeIntervalSince(start))
+        guard remaining > 0 else { return }  // about to expire; let the timer finish it
+        stopDisplayTimer()
+        timeRemaining = remaining
+        phaseStartDate = nil
+        isPaused = true
+        saveState()
+        onTimerTick?(timeRemaining, phase)
+    }
+
+    /// Restart a paused countdown from where it stopped.
+    func resume() {
+        guard phase == .work, isPaused, timeRemaining > 0 else { return }
+        phaseStartDate = Date().addingTimeInterval(-Double(phaseDuration - timeRemaining))
+        isPaused = false
+        saveState()
+        startDisplayTimer()
+        onWorkStart?()
     }
 
     var workDurationOverride: Int?
@@ -517,6 +570,7 @@ final class PomodoroScheduler: ObservableObject {
         snoozeTimer?.invalidate()
         snoozeTimer = nil
         cancelBreakSnooze()
+        isPaused = false
         phase = isLong ? .longBreak : .shortBreak
         phaseDuration = (isLong ? longBreakDuration : shortBreakDuration) * 60
         timeRemaining = phaseDuration
@@ -547,6 +601,7 @@ final class PomodoroScheduler: ObservableObject {
     /// incomplete — it was already recorded `completed` when the timer expired.
     func endToIdle() {
         phase = .idle
+        isPaused = false
         timeRemaining = 0
         phaseStartDate = nil
         phaseDuration = 0
@@ -3836,6 +3891,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private let calendarMonitor = CalendarMonitor()
     private let caffeinator = BreakCaffeinator()
     private var pomodoroActionMenuItem: NSMenuItem?
+    private var pomodoroPauseMenuItem: NSMenuItem?
     private var currentTaskMenuItem: NSMenuItem?
     // A persistent, non-nagging signal that the coach is broken: the modal is
     // throttled, but this menu row stays until a call succeeds. Clicking it
@@ -3976,6 +4032,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             }
             pomodoroTransitionWindow?.close()
             startPomodoroNow()
+        case "pause-pomodoro":
+            pausePomodoro()
+        case "resume-pomodoro":
+            resumePomodoro()
         case "test-milestone-sound":
             playMilestoneSound()
         case "test-coach":
@@ -4030,6 +4090,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         pomodoroAction.target = self
         pomodoroActionMenuItem = pomodoroAction
         menu.addItem(pomodoroAction)
+        let pauseItem = NSMenuItem(title: "Pause Pomodoro", action: #selector(togglePausePomodoro), keyEquivalent: "")
+        pauseItem.target = self
+        pauseItem.isHidden = true
+        pomodoroPauseMenuItem = pauseItem
+        menu.addItem(pauseItem)
         let currentTask = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         currentTask.isEnabled = false
         currentTask.isHidden = true
@@ -4120,8 +4185,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
                 let secs = seconds % 60
-                self.statusItem.button?.title = String(format: "🍅 %02d:%02d", mins, secs)
-                self.statusItem.button?.toolTip = seconds > 0 && !todo.isEmpty ? "Top to-do: \(todo)" : nil
+                let paused = self.pomodoroScheduler.isPaused
+                self.statusItem.button?.title = String(format: "%@ %02d:%02d", paused ? "⏸" : "🍅", mins, secs)
+                if paused {
+                    self.statusItem.button?.toolTip = "Pomodoro paused"
+                } else {
+                    self.statusItem.button?.toolTip = seconds > 0 && !todo.isEmpty ? "Top to-do: \(todo)" : nil
+                }
             case .shortBreak, .longBreak:
                 self.statusItem.button?.image = nil
                 let mins = seconds / 60
@@ -4462,8 +4532,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         case .takeBreak: pomodoroActionMenuItem?.action = #selector(takeBreakNow)
         case .endBreak: pomodoroActionMenuItem?.action = #selector(endBreakFromMenu)
         }
+        pomodoroPauseMenuItem?.isHidden = !pomodoroScheduler.canTogglePause
+        pomodoroPauseMenuItem?.title = pomodoroScheduler.isPaused ? "Resume Pomodoro" : "Pause Pomodoro"
         currentTaskMenuItem?.title = "Top to-do: \(topTodo)"
-        currentTaskMenuItem?.isHidden = action != .abandon || topTodo.isEmpty
+        currentTaskMenuItem?.isHidden = action != .abandon || pomodoroScheduler.isPaused || topTodo.isEmpty
+    }
+
+    @objc private func togglePausePomodoro() {
+        if pomodoroScheduler.isPaused { resumePomodoro() } else { pausePomodoro() }
+    }
+
+    /// Freeze the work countdown. Focus checks and work caffeination stop until
+    /// it resumes; `resume()` fires `onWorkStart`, which restarts both.
+    private func pausePomodoro() {
+        guard pomodoroScheduler.canTogglePause, !pomodoroScheduler.isPaused else { return }
+        pomodoroScheduler.pause()
+        guard pomodoroScheduler.isPaused else { return }
+        focusMonitor.stop()
+        caffeinator.sessionEnded()
+    }
+
+    private func resumePomodoro() {
+        pomodoroScheduler.resume()
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
