@@ -1267,6 +1267,40 @@ do {
     checkEqual(monitor.minutesUntilNextBusy(from: now), 20, "the earliest block wins the cap")
 }
 
+section("PomodoroMeetingCap: run into a meeting to reach the daily-count threshold")
+do {
+    func cap(_ until: Int?, work: Int = 50) -> Int {
+        PomodoroMeetingCap.workMinutes(workDuration: work, minutesUntilNextBusy: until,
+                                       meetingBuffer: 1, minDuration: 10)
+    }
+    checkEqual(PomodoroSession.minimumCountedMinutes(workDuration: 50), 45, "threshold is 90% of 50")
+    checkEqual(PomodoroSession.minimumCountedMinutes(workDuration: 25), 23, "threshold rounds up")
+    checkEqual(cap(nil), 50, "no meeting: full length")
+    checkEqual(cap(90), 50, "distant meeting: full length")
+    checkEqual(cap(46), 45, "buffer already leaves the threshold")
+    checkEqual(cap(45), 45, "extend to end at the meeting start")
+    checkEqual(cap(44), 45, "run 1 min into the meeting")
+    checkEqual(cap(43), 45, "run 2 min into the meeting")
+    checkEqual(cap(42), 41, "3 min would be too far: truncate as before")
+    checkEqual(cap(20), 19, "short gap: truncate as before")
+    checkEqual(cap(5), 10, "tiny gap: minimum duration as before")
+
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    check(PomodoroMeetingCap.ranInto(eventStart: t0, sessionStart: t0 - 2700, now: t0 + 120),
+          "pomodoro started before the meeting and ended after it began")
+    check(PomodoroMeetingCap.ranInto(eventStart: t0, sessionStart: t0 - 2700, now: t0 - 30),
+          "ended under a minute before the meeting (extended to its start)")
+    check(!PomodoroMeetingCap.ranInto(eventStart: t0, sessionStart: t0 - 2700, now: t0 - 61),
+          "normally capped: ended over a minute before the meeting")
+    check(!PomodoroMeetingCap.ranInto(eventStart: t0, sessionStart: t0 + 600, now: t0 + 3300),
+          "pomodoro started during the meeting: not an overrun")
+
+    let fourFive = PomodoroSession(startTime: t0, taskDescription: "", completed: true, pomodoroNumber: 1, plannedMinutes: 45)
+    let fourFour = PomodoroSession(startTime: t0, taskDescription: "", completed: true, pomodoroNumber: 1, plannedMinutes: 44)
+    check(fourFive.meetsDailyCountThreshold(workDuration: 50), "45 of 50 counts")
+    check(!fourFour.meetsDailyCountThreshold(workDuration: 50), "44 of 50 doesn't")
+}
+
 // MARK: - Summary
 
 print("\n\(passes) passed, \(failures) failed")

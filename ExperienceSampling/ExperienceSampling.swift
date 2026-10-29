@@ -57,7 +57,46 @@ struct PomodoroSession: Codable, Identifiable {
 
     func meetsDailyCountThreshold(workDuration: Int) -> Bool {
         guard let plannedMinutes else { return true }
-        return Double(plannedMinutes) >= Double(workDuration) * 0.9
+        return plannedMinutes >= Self.minimumCountedMinutes(workDuration: workDuration)
+    }
+
+    /// Shortest planned length that counts towards the daily total: 90% of the
+    /// work duration, rounded up (45 for 50). Integer math, so no float edge.
+    static func minimumCountedMinutes(workDuration: Int) -> Int {
+        (workDuration * 9 + 9) / 10
+    }
+}
+
+/// Sizing a pomodoro around the next calendar block. Pure, so it's unit-tested.
+enum PomodoroMeetingCap {
+    /// How far a pomodoro may run into the next block so that it still counts
+    /// towards the daily total instead of being truncated just short of it.
+    static let overrunAllowance = 2
+
+    /// Work minutes for a pomodoro whose next block starts in `minutesUntilNextBusy`
+    /// (floored, so the real gap is up to a minute longer). Normally it ends
+    /// `meetingBuffer` minutes before the block, never shorter than `minDuration`.
+    /// If that would fall below the daily-count threshold but the threshold is
+    /// reachable by running at most `overrunAllowance` minutes into the block,
+    /// it runs to the threshold instead.
+    static func workMinutes(workDuration: Int, minutesUntilNextBusy: Int?,
+                            meetingBuffer: Int, minDuration: Int) -> Int {
+        guard let minsUntil = minutesUntilNextBusy else { return workDuration }
+        let capped = min(workDuration, max(minsUntil - meetingBuffer, minDuration))
+        let threshold = PomodoroSession.minimumCountedMinutes(workDuration: workDuration)
+        if capped < threshold, threshold - minsUntil <= overrunAllowance {
+            return threshold
+        }
+        return capped
+    }
+
+    /// Whether a pomodoro that started at `sessionStart` and ended at `now` ran
+    /// up to (or into) an event: the event began after the pomodoro did and
+    /// starts less than a minute after it ended. A normally capped pomodoro ends
+    /// at least `meetingBuffer` (1 min) early, so in practice this is the
+    /// extended case; the minute of slack covers flooring in `workMinutes`.
+    static func ranInto(eventStart: Date, sessionStart: Date, now: Date) -> Bool {
+        sessionStart < eventStart && eventStart < now.addingTimeInterval(60)
     }
 }
 
@@ -197,6 +236,9 @@ final class PomodoroDataStore {
         sessions[sessions.count - 1].plannedMinutes = minutes
         save()
     }
+
+    /// Start of the most recent session (the one that just ended, at work end).
+    var lastSessionStart: Date? { sessions.last?.startTime }
 
     func updateLast(endTime: Date, completed: Bool) {
         guard !sessions.isEmpty else { return }
@@ -3611,6 +3653,37 @@ struct EventNoticeView: View {
     }
 }
 
+/// Shown when a pomodoro ends at or after a meeting's start (it was extended
+/// so it would count towards the daily total).
+struct MeetingStartedView: View {
+    let title: String
+    /// Opens the meeting's video link; nil when the event has none.
+    var onJoin: (() -> Void)?
+    var onDismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Text("Time to go to \(title)").font(.title2).fontWeight(.semibold)
+                .multilineTextAlignment(.center)
+            Text("Pomodoro done. Head to your meeting.")
+            HStack {
+                if let onJoin {
+                    Button("Dismiss") { onDismiss() }
+                    Button("Join Meeting") { onJoin() }
+                        .keyboardShortcut(.return, modifiers: [])
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Button("OK") { onDismiss() }
+                        .keyboardShortcut(.return, modifiers: [])
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 340)
+    }
+}
+
 /// Confirmation for the coach connection check — the happy-path counterpart to
 /// `CoachErrorView`.
 struct CoachOKView: View {
@@ -3936,22 +4009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         pomodoroScheduler.onTimerTick = { [weak self] seconds, phase in
             self?.updateMenuBarForPomodoro(seconds: seconds, phase: phase)
         }
-        pomodoroScheduler.onWorkSessionEnd = { [weak self] in
-            guard let self else { return }
-            self.focusMonitor.stop()
-            self.topTodo = ""
-            self.playMilestoneSoundIfDue()
-            // If a calendar block is starting now, don't offer a break: a video
-            // meeting passes silently; a non-video block (e.g. "Lunch") shows a
-            // notice. Otherwise fall through to the normal break prompt.
-            if let event = self.calendarMonitor.currentOrImminentEvent(within: self.meetingBuffer + 2) {
-                if (event.meetLink ?? "").isEmpty, !event.isOutOfOffice { self.showEventNotice(title: event.summary) }
-                self.pomodoroScheduler.endToIdle()
-                self.scheduleResumeAfterEvent(end: event.end)
-            } else {
-                self.showPomodoroBreak()
-            }
-        }
+        pomodoroScheduler.onWorkSessionEnd = { [weak self] in self?.handleWorkSessionEnd() }
         pomodoroScheduler.onBreakStart = { [weak self] in self?.caffeinator.breakStarted() }
         pomodoroScheduler.onBreakEnd = { [weak self] in
             self?.caffeinator.breakEnded()
@@ -4310,11 +4368,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     // The workday cap only applies while at least a minPomodoroDuration slice of
     // the day is left; once it's after hours (or under that slice), the cap is
     // skipped so an explicit start still runs a full pomodoro when working late.
+    // A pomodoro that would be truncated just short of counting towards the daily
+    // total may instead run a couple of minutes into the block (PomodoroMeetingCap).
     private func availableWorkMinutes() -> Int {
-        var cap = pomodoroScheduler.workDuration
-        if let minsUntil = calendarMonitor.minutesUntilNextBusy() {
-            cap = min(cap, max(minsUntil - meetingBuffer, minPomodoroDuration))
-        }
+        var cap = PomodoroMeetingCap.workMinutes(
+            workDuration: pomodoroScheduler.workDuration,
+            minutesUntilNextBusy: calendarMonitor.minutesUntilNextBusy(),
+            meetingBuffer: meetingBuffer,
+            minDuration: minPomodoroDuration
+        )
         let left = minutesUntilEndOfWorkday()
         if left >= minPomodoroDuration { cap = min(cap, left) }
         return cap
@@ -4470,6 +4532,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func showEventNotice(title: String) {
         let view = EventNoticeView(title: title, onDismiss: { [weak self] in self?.closeTopModal() })
         showWindow(view)
+    }
+
+    private func handleWorkSessionEnd() {
+        focusMonitor.stop()
+        topTodo = ""
+        playMilestoneSoundIfDue()
+        // If a calendar block is starting now, don't offer a break: a video
+        // meeting passes silently; a non-video block (e.g. "Lunch") shows a
+        // notice, and one the pomodoro ran up to or into (PomodoroMeetingCap)
+        // gets a "go to the meeting" popup. Otherwise offer the break.
+        if let event = calendarMonitor.currentOrImminentEvent(within: meetingBuffer + 2) {
+            let now = Date()
+            let ranInto = PomodoroDataStore.shared.lastSessionStart.map {
+                PomodoroMeetingCap.ranInto(eventStart: event.start, sessionStart: $0, now: now)
+            } ?? false
+            if event.isOutOfOffice {
+                // OOO: go idle silently.
+            } else if ranInto {
+                showMeetingStartedNotice(event)
+            } else if (event.meetLink ?? "").isEmpty {
+                showEventNotice(title: event.summary)
+            }
+            pomodoroScheduler.endToIdle()
+            scheduleResumeAfterEvent(end: event.end)
+        } else {
+            showPomodoroBreak()
+        }
+    }
+
+    // Shown when a pomodoro ran up to or into a meeting.
+    private func showMeetingStartedNotice(_ event: CalendarEvent) {
+        let link = (event.meetLink ?? "").isEmpty ? nil : event.meetLink.flatMap(URL.init(string:))
+        let view = MeetingStartedView(
+            title: event.summary,
+            onJoin: link.map { url in { [weak self] in
+                NSWorkspace.shared.open(url)
+                self?.closeTopModal()
+            } },
+            onDismiss: { [weak self] in self?.closeTopModal() }
+        )
+        _ = showWindow(view, stealFocus: true)
     }
 
     private func showCoachOK(model: String, reply: String) {

@@ -74,6 +74,11 @@ The other dropdown entries are:
   started today count if their planned duration is at least 90% of the configured
   work duration (45–50 minutes for a 50-minute setting). Longer sessions and older
   records without a planned duration still count; abandoned sessions do not.
+  A pomodoro capped by an upcoming meeting normally ends a minute before it. If
+  that would leave it below the 90% threshold but it could reach the threshold
+  by running at most 2 minutes into the meeting, it runs to the threshold, and
+  ends with a "Time to go to …" popup (with a Join Meeting button when the
+  event has a video link).
 - **Coach/calendar warning** — shown only while an error is pinned; opens its
   explanation and recovery actions in any timer state.
 - **View History**, **Pomodoro History**, **Export Data…**, **Settings…**, and
