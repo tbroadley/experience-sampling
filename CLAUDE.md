@@ -165,6 +165,23 @@ the exit status. Two traps:
   `calendar-` kind prefix before clearing it. Without that, a coach recovery
   wipes a still-valid calendar warning and vice versa.
 
+## Running into a meeting to reach the daily count
+
+`PomodoroMeetingCap.workMinutes` (pure, unit-tested) sizes a pomodoro around
+the next calendar block. Normally it ends `meetingBuffer` (1 min) before the
+block. If that is below `PomodoroSession.minimumCountedMinutes` (90% of the work
+duration, rounded up with integer math) but the threshold is at most
+`overrunAllowance` (2) minutes past the block's start, the pomodoro runs to the
+threshold instead. `minutesUntilNextBusy` is floored, so the real overrun is at
+most 2 minutes. The workday-end cap still applies afterwards.
+
+At work end, `PomodoroMeetingCap.ranInto` detects this case statelessly: the
+last session started before the event, and the event starts less than a minute
+after the pomodoro ended (a normal cap ends at least a minute early). A
+non-OOO event in that case gets `MeetingStartedView` ("Time to go to …", with
+Join Meeting when there's a video link) instead of the silent video-meeting path
+or the plain `EventNoticeView`.
+
 ## Meeting Attention
 
 `MeetingAttentionMonitor` nudges the user back when they drift away from a live
