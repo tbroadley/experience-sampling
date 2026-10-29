@@ -4009,34 +4009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         pomodoroScheduler.onTimerTick = { [weak self] seconds, phase in
             self?.updateMenuBarForPomodoro(seconds: seconds, phase: phase)
         }
-        pomodoroScheduler.onWorkSessionEnd = { [weak self] in
-            guard let self else { return }
-            self.focusMonitor.stop()
-            self.topTodo = ""
-            self.playMilestoneSoundIfDue()
-            // If a calendar block is starting now, don't offer a break: a video
-            // meeting passes silently; a non-video block (e.g. "Lunch") shows a
-            // notice. Otherwise fall through to the normal break prompt.
-            // A pomodoro that ran up to or into a meeting (see PomodoroMeetingCap)
-            // always gets a popup telling the user to go to it.
-            if let event = self.calendarMonitor.currentOrImminentEvent(within: self.meetingBuffer + 2) {
-                let now = Date()
-                let ranInto = PomodoroDataStore.shared.lastSessionStart.map {
-                    PomodoroMeetingCap.ranInto(eventStart: event.start, sessionStart: $0, now: now)
-                } ?? false
-                if event.isOutOfOffice {
-                    // OOO: go idle silently.
-                } else if ranInto {
-                    self.showMeetingStartedNotice(event)
-                } else if (event.meetLink ?? "").isEmpty {
-                    self.showEventNotice(title: event.summary)
-                }
-                self.pomodoroScheduler.endToIdle()
-                self.scheduleResumeAfterEvent(end: event.end)
-            } else {
-                self.showPomodoroBreak()
-            }
-        }
+        pomodoroScheduler.onWorkSessionEnd = { [weak self] in self?.handleWorkSessionEnd() }
         pomodoroScheduler.onBreakStart = { [weak self] in self?.caffeinator.breakStarted() }
         pomodoroScheduler.onBreakEnd = { [weak self] in
             self?.caffeinator.breakEnded()
@@ -4559,6 +4532,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func showEventNotice(title: String) {
         let view = EventNoticeView(title: title, onDismiss: { [weak self] in self?.closeTopModal() })
         showWindow(view)
+    }
+
+    private func handleWorkSessionEnd() {
+        focusMonitor.stop()
+        topTodo = ""
+        playMilestoneSoundIfDue()
+        // If a calendar block is starting now, don't offer a break: a video
+        // meeting passes silently; a non-video block (e.g. "Lunch") shows a
+        // notice, and one the pomodoro ran up to or into (PomodoroMeetingCap)
+        // gets a "go to the meeting" popup. Otherwise offer the break.
+        if let event = calendarMonitor.currentOrImminentEvent(within: meetingBuffer + 2) {
+            let now = Date()
+            let ranInto = PomodoroDataStore.shared.lastSessionStart.map {
+                PomodoroMeetingCap.ranInto(eventStart: event.start, sessionStart: $0, now: now)
+            } ?? false
+            if event.isOutOfOffice {
+                // OOO: go idle silently.
+            } else if ranInto {
+                showMeetingStartedNotice(event)
+            } else if (event.meetLink ?? "").isEmpty {
+                showEventNotice(title: event.summary)
+            }
+            pomodoroScheduler.endToIdle()
+            scheduleResumeAfterEvent(end: event.end)
+        } else {
+            showPomodoroBreak()
+        }
     }
 
     // Shown when a pomodoro ran up to or into a meeting.
