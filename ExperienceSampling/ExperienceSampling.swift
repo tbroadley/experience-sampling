@@ -937,9 +937,12 @@ final class CalendarMonitor {
     private var avCheckTimer: Timer?
     private var lastCalendarErrorKind: String?
     private var errorThrottle = CoachErrorThrottle()
-    /// Fired (on the main queue) when a calendar read fails in a way the user
-    /// needs to know about — throttled per kind, like the coach's own errors.
-    var onError: ((CoachError) -> Void)?
+    private var failureGate = CalendarFailureGate()
+    /// Fired (on the main queue) on every failed calendar read. `presentModal`
+    /// is true only when the failure is worth interrupting for — gated by
+    /// `CalendarFailureGate`, then throttled per kind like the coach's own errors;
+    /// otherwise the UI should just pin the menu-bar row.
+    var onError: ((_ error: CoachError, _ presentModal: Bool) -> Void)?
     /// Fired (on the main queue) the first time a refresh succeeds after
     /// failures, so the UI can clear its "calendar is broken" indicator.
     var onRecovered: (() -> Void)?
@@ -1279,8 +1282,9 @@ final class CalendarMonitor {
                 self.lastCalendarErrorKind = mapped.kind
                 CoachLog.record(mapped, context: "calendar refresh")
             }
-            guard self.errorThrottle.shouldSurface(mapped) else { return }
-            self.onError?(mapped)
+            let presentModal = self.failureGate.recordFailure(mapped)
+                && self.errorThrottle.shouldSurface(mapped)
+            self.onError?(mapped, presentModal)
         }
     }
 
@@ -1290,6 +1294,7 @@ final class CalendarMonitor {
             CoachLog.record("calendar recovered — a refresh succeeded after earlier failures")
             self.lastCalendarErrorKind = nil
             self.errorThrottle.reset()
+            self.failureGate.reset()
             self.onRecovered?()
         }
     }
@@ -2238,6 +2243,26 @@ struct CoachErrorThrottle {
     var hasRecordedFailures: Bool { !lastSurfaced.isEmpty }
 
     mutating func reset() { lastSurfaced.removeAll() }
+}
+
+/// Decides whether a calendar read failure is worth a modal. A one-off network
+/// blip (asleep, offline, Wi-Fi reconnecting) fixes itself on the next 5-minute
+/// refresh, yet used to pop a modal that then sat on screen for hours after the
+/// calendar had recovered. Transient failures therefore need several reads in a
+/// row before they interrupt; auth and scope failures never fix themselves, so
+/// they are loud on the first read. Pure state so the policy is unit-tested.
+struct CalendarFailureGate {
+    static let transientFailuresBeforeModal = 3
+
+    private(set) var consecutiveFailures = 0
+
+    /// Counts one failed read; true when it should open the modal.
+    mutating func recordFailure(_ error: CoachError) -> Bool {
+        consecutiveFailures += 1
+        return !error.isTransient || consecutiveFailures >= Self.transientFailuresBeforeModal
+    }
+
+    mutating func reset() { consecutiveFailures = 0 }
 }
 
 final class FocusMonitor {
@@ -3972,6 +3997,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var coachStatusMenuItem: NSMenuItem?
     private var completedTodayMenuItem: NSMenuItem?
     private var lastCoachError: CoachError?
+    // The open calendar error modal, if any, so a calendar recovery can close it
+    // instead of leaving a stale "can't read your calendar" on screen.
+    private weak var calendarErrorWindow: NSWindow?
     // The live top to-do the focus coach is tracking, shown in the menu.
     private var topTodo: String = ""
     private var intradaySnoozeTimer: Timer?
@@ -4054,11 +4082,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         // The calendar shares the coach's error surface — same modal, same
         // menu-bar row. A dead calendar takes out meeting nudges, pomodoro
         // capping and Meet-link auto-open, none of which announce their absence.
-        calendarMonitor.onError = { [weak self] error in
-            self?.showCoachError(error)
+        calendarMonitor.onError = { [weak self] error, presentModal in
+            guard let self else { return }
+            if presentModal {
+                self.showCoachError(error)
+            } else {
+                self.pinCoachError(error)
+            }
         }
         calendarMonitor.onRecovered = { [weak self] in
-            guard let self, let shown = self.lastCoachError else { return }
+            guard let self else { return }
+            self.calendarErrorWindow?.close()
+            guard let shown = self.lastCoachError else { return }
             // Only clear if the pinned row is the calendar's own — a live coach
             // error must not be wiped by an unrelated calendar recovery.
             guard shown.kind.hasPrefix("calendar-") else { return }
@@ -4583,10 +4618,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     /// Surface a coach failure: a modal now (the monitor throttles how often this
     /// is called) plus a menu row that persists until a call succeeds.
     private func showCoachError(_ error: CoachError) {
+        pinCoachError(error)
+        presentCoachError(error)
+    }
+
+    /// Show the persistent menu-bar row without a modal.
+    private func pinCoachError(_ error: CoachError) {
         lastCoachError = error
         coachStatusMenuItem?.title = "⚠︎ \(error.title)"
         coachStatusMenuItem?.isHidden = false
-        presentCoachError(error)
     }
 
     @objc private func showLastCoachError() {
@@ -4611,7 +4651,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             },
             onDismiss: { [weak self] in self?.closeTopModal() }
         )
-        showWindow(view)
+        let isCalendar = error.kind.hasPrefix("calendar-")
+        // One calendar modal at a time: a newer one replaces the old.
+        if isCalendar { calendarErrorWindow?.close() }
+        let window = showWindow(view)
+        if isCalendar { calendarErrorWindow = window }
     }
 
     // Available as soon as work ends, whether the break prompt is open or snoozed.
