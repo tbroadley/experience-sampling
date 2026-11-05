@@ -930,6 +930,25 @@ do {
           "a recovery re-arms the throttle, so the next break is loud again")
 }
 
+section("CalendarFailureGate: a one-off blip stays quiet, a lasting outage or auth failure is loud")
+do {
+    let blip = CoachError.calendarUnavailable("gws calendar exited 5: error: HTTP request failed")
+    var gate = CalendarFailureGate()
+    check(!gate.recordFailure(blip), "a single network failure doesn't open a modal")
+    check(!gate.recordFailure(blip), "nor does a second in a row")
+    check(gate.recordFailure(blip), "the third consecutive failure does")
+    check(gate.recordFailure(blip), "and the outage stays loud (the throttle limits repeats)")
+
+    gate.reset()
+    check(!gate.recordFailure(blip), "a recovery re-arms the gate, so the next blip is quiet again")
+
+    var authGate = CalendarFailureGate()
+    check(authGate.recordFailure(.calendarScopeMissing("x")), "a missing scope is loud on the first read")
+    var signInGate = CalendarFailureGate()
+    check(signInGate.recordFailure(.calendarAuthRequired("invalid_grant")),
+          "an expired Google sign-in is loud on the first read")
+}
+
 section("PromptPolicy: weekends are quiet unless there's work happening")
 do {
     var cal = Calendar(identifier: .gregorian)

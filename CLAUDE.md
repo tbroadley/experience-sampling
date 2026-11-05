@@ -155,6 +155,12 @@ the exit status. Two traps:
   per kind by `CoachErrorThrottle`. Logging alone wasn't enough: a missing
   `calendar` scope once sat in the log for twelve days because nothing the user
   could see changed.
+- Transient failures (`calendarUnavailable`, e.g. `HTTP request failed` while
+  asleep or offline) pin the menu-bar row straight away but only open the modal
+  after `CalendarFailureGate.transientFailuresBeforeModal` (3) consecutive failed
+  reads; auth and scope failures open it on the first read. A recovery closes any
+  open calendar modal (`calendarErrorWindow`) — an overnight blip used to leave a
+  stale modal on screen for hours after the calendar was fine again.
 - `CalendarMonitor.calendarError(from:)` distinguishes expired logins from
   missing Calendar permissions by the error detail. Task errors never trigger
   Google sign-in.
